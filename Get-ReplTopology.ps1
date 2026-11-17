@@ -8,8 +8,8 @@
 
 .DESCRIPTION
     Script  : Get-ReplTopology.ps1
-    Version : 1.9
-    Author  : Wojtek Kuncewicz
+    Version : 1.10
+    Author  : Wojtek
     Created : 2017-03-14
 
     Version history:
@@ -116,6 +116,14 @@
                                  filtered tables are compared too. A data error on a filtered article
                                  offers a filtered count comparison instead of tablediff (its fix would
                                  copy the rows and columns the filter leaves out).
+        1.10 2026-11-11  Wojtek  JSON of the report written 38x faster (same output). A repair is refused
+                                 when it changed since it was shown (fingerprint), refusals are logged.
+                                 Warning for parameters the chosen mode does not use; the password
+                                 warning for servers found by crawling; -ScanHost accepts answers only
+                                 from the asked hosts. CSV cells starting with = + - @ get an apostrophe.
+                                 AI report masks quoted values, accounts, UNC paths, IPv6. Console:
+                                 'blocked' filter as on the page, terminal restored after a start error,
+                                 control characters stripped. Page polls slower when hidden or offline.
 
     How it works:
     - No modules to install (uses System.Data.SqlClient from .NET). Runs in Windows
@@ -436,8 +444,8 @@ param(
     [string]$BrowserPath,
     [ValidateSet('LR', 'TB')][string]$Direction = 'LR',
     [int]$MaxServers = 200,
-    [int]$ConnectTimeout = 10,
-    [int]$QueryTimeout = 120,
+    [ValidateRange(0, 2147483647)][int]$ConnectTimeout = 10,
+    [ValidateRange(0, 2147483647)][int]$QueryTimeout = 120,
     [ValidateRange(1, 64)][int]$ThrottleLimit = 8,
     [string]$MermaidJs = (Join-Path $PSScriptRoot 'mermaid.min.js'),
     [switch]$Monitor,
@@ -449,18 +457,38 @@ param(
     [switch]$AllowRepair,
     [switch]$AllowAllRepair,
     [switch]$NoMask,
-    [switch]$Console
+    [switch]$Console,
+    [ValidateRange(0, 86400)][int]$TopologyEverySeconds = 300,
+    [switch]$PersistHistory,
+    [ValidateRange(1, 365)][int]$HistoryDays = 7,
+    [ValidateRange(1, 64)][int]$HistoryMaxMB = 8
 )
 
 Set-StrictMode -Version 2
 $ErrorActionPreference = 'Stop'
-$scriptVersion = '1.9'
+$scriptVersion = '1.10'
 $levelRank = @{ '' = 0; ok = 1; unknown = 2; warn = 3; error = 4; removed = -1 }
 if ($Console) { $Monitor = $true }   # -Console = the live monitor drawn in this console window
 if ($Monitor) {
     # Live monitor: no report files and no row counts; pending commands are counted by the monitor itself
     $NoPdf = $true; $NoRowCounts = $true; $NoPendingCommands = $true; $NoHealth = $false; $CompareTo = ''
 }
+$ignored = @()
+if ($Monitor) {
+    foreach ($n in 'CompareTo', 'PdfPerServer', 'PaperSize', 'NoPdf', 'BrowserPath', 'NoRowCounts', 'FilteredRowCounts', 'NoPendingCommands', 'NoHealth', 'TestOnly') {
+        if ($PSBoundParameters.ContainsKey($n)) { $ignored += "-$n" }
+    }
+    if ($Console) {
+        foreach ($n in 'NoOpen', 'ListenAddress', 'Port') {
+            if ($PSBoundParameters.ContainsKey($n)) { $ignored += "-$n" }
+        }
+    }
+} else {
+    foreach ($n in 'AllowTracerTokens', 'ListenAddress', 'Port', 'RefreshSeconds', 'PendingEvery', 'AllowRepair', 'AllowAllRepair', 'TopologyEverySeconds', 'PersistHistory', 'HistoryDays', 'HistoryMaxMB') {
+        if ($PSBoundParameters.ContainsKey($n)) { $ignored += "-$n" }
+    }
+}
+if ($ignored) { Write-Warning "Not used in this mode: $($ignored -join ', ')" }
 
 # ---------------------------------------------------------------------------
 # Login and SQL client
@@ -604,13 +632,17 @@ SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 DECLARE @err nvarchar(max) = N'
 OUTER APPLY (SELECT STUFF((SELECT N'' | '' + r.error_text FROM dbo.MSrepl_errors r
                            WHERE h.error_id <> 0 AND r.id = h.error_id ORDER BY r.[time]
-                           FOR XML PATH(N''''), TYPE).value(N''.'', N''nvarchar(max)''), 1, 3, N'''') AS error_text) er';
+                           FOR XML PATH(N''''), TYPE).value(N''.'', N''nvarchar(max)''), 1, 3, N'''') AS error_text,
+                          (SELECT TOP (1) r2.error_code FROM dbo.MSrepl_errors r2 WHERE h.error_id <> 0 AND r2.id = h.error_id) AS error_code,
+                          (SELECT TOP (1) CONVERT(varchar(80), r3.xact_seqno, 1) FROM dbo.MSrepl_errors r3
+                           WHERE h.error_id <> 0 AND r3.id IN (h.error_id, h.error_id + 1) AND r3.xact_seqno IS NOT NULL AND r3.xact_seqno <> 0x00
+                           ORDER BY r3.id DESC) AS xact_seqno) er';
 DECLARE @sql nvarchar(max) = N'
 WITH srv AS (' + @srv + N')
 SELECT N''D'' AS kind, a.id AS agent_id, a.name, CONVERT(nvarchar(36), CONVERT(uniqueidentifier, a.job_id)) AS job_id,
        a.profile_id, a.subscription_type, CAST(a.subscriber_security_mode AS int) AS security_mode, a.subscriber_login AS login_name,
        ISNULL(ps.name, N'''') AS publisher, a.publisher_db, a.publication, ISNULL(ss.name, N'''') AS subscriber, a.subscriber_db,
-       h.runstatus, h.[time], h.comments, er.error_text, st.fails, st.retries, st.max_latency
+       h.runstatus, h.[time], h.comments, er.error_text, st.fails, st.retries, st.max_latency, h.error_id, er.error_code, er.xact_seqno
 FROM dbo.MSdistribution_agents a
 LEFT JOIN srv ps ON ps.id = a.publisher_id
 LEFT JOIN srv ss ON ss.id = a.subscriber_id
@@ -625,7 +657,7 @@ UNION ALL
 SELECT N''L'', a.id, a.name, CONVERT(nvarchar(36), CONVERT(uniqueidentifier, a.job_id)),
        a.profile_id, NULL, CAST(a.publisher_security_mode AS int), a.publisher_login,
        ISNULL(ps.name, N''''), a.publisher_db, a.publication, NULL, NULL,
-       h.runstatus, h.[time], h.comments, er.error_text, st.fails, st.retries, st.max_latency
+       h.runstatus, h.[time], h.comments, er.error_text, st.fails, st.retries, st.max_latency, h.error_id, er.error_code, er.xact_seqno
 FROM dbo.MSlogreader_agents a
 LEFT JOIN srv ps ON ps.id = a.publisher_id
 OUTER APPLY (SELECT TOP (1) x.runstatus, x.[time], x.comments, x.error_id
@@ -639,7 +671,7 @@ UNION ALL
 SELECT N''S'', a.id, a.name, CONVERT(nvarchar(36), CONVERT(uniqueidentifier, a.job_id)),
        a.profile_id, NULL, CAST(a.publisher_security_mode AS int), a.publisher_login,
        ISNULL(ps.name, N''''), a.publisher_db, a.publication, NULL, NULL,
-       h.runstatus, h.[time], h.comments, er.error_text, NULL, NULL, NULL
+       h.runstatus, h.[time], h.comments, er.error_text, NULL, NULL, NULL, h.error_id, er.error_code, er.xact_seqno
 FROM dbo.MSsnapshot_agents a
 LEFT JOIN srv ps ON ps.id = a.publisher_id
 OUTER APPLY (SELECT TOP (1) x.runstatus, x.[time], x.comments, x.error_id
@@ -648,7 +680,7 @@ IF OBJECT_ID(N'dbo.MSmerge_agents') IS NOT NULL AND OBJECT_ID(N'dbo.MSmerge_hist
   SET @sql = @sql + N'
 UNION ALL
 SELECT N''M'', a.id, a.name, NULL, NULL, NULL, NULL, NULL, N'''', a.publisher_db, a.publication, N'''', NULL,
-       NULL, h.[time], h.comments, er.error_text, NULL, NULL, NULL
+       NULL, h.[time], h.comments, er.error_text, NULL, NULL, NULL, h.error_id, er.error_code, er.xact_seqno
 FROM dbo.MSmerge_agents a
 OUTER APPLY (SELECT TOP (1) x.[time], x.comments, x.error_id
              FROM dbo.MSmerge_history x WHERE x.agent_id = a.id ORDER BY x.[timestamp] DESC) h' + @err;
@@ -769,6 +801,7 @@ WHERE prm.parameter_name LIKE N'%SkipErrors%' OR prm.parameter_name LIKE N'%Encr
 ELSE
 SELECT CAST(NULL AS int) AS profile_id, CAST(NULL AS sysname) AS profile_name, CAST(NULL AS sysname) AS parameter_name, CAST(NULL AS nvarchar(255)) AS value WHERE 1 = 0;
 '@
+    LinkedServers = 'SELECT name FROM sys.servers WHERE server_id <> 0;'
     DistPubs   = 'SELECT name, distribution_db, working_directory, security_mode FROM msdb.dbo.MSdistpublishers;'
     Retention  = @'
 IF OBJECT_ID(N'msdb.dbo.MSdistributiondbs') IS NOT NULL
@@ -784,6 +817,47 @@ ELSE
     Pubs       = $pubQuery
     DistHealth = $distHealthQuery
     Perm       = "SELECT IS_SRVROLEMEMBER('sysadmin') AS sa, IS_MEMBER('db_owner') AS dbo;"
+    TableContract = @'
+IF COALESCE(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DEFINITION'), 0) <> 1
+  RAISERROR ('VIEW DEFINITION required for complete column contract metadata.', 16, 1);
+ELSE BEGIN
+  DECLARE @wanted TABLE (f nvarchar(261) NULL, b sysname NULL);
+  IF @tablesXml IS NOT NULL AND LEN(@tablesXml) > 0 BEGIN
+    DECLARE @req xml = CAST(@tablesXml AS xml);
+    INSERT INTO @wanted (f, b)
+    SELECT x.n.value('@f', 'nvarchar(261)'), x.n.value('@b', 'sysname')
+    FROM @req.nodes('/tables/t') AS x(n);
+  END
+  SELECT sch.name + N'.' + t.name AS table_name, t.name AS table_basename, c.name AS column_name,
+         ty.name AS type_name, c.max_length, c.precision, c.scale,
+         CAST(c.is_nullable AS int) AS nullable, c.collation_name,
+         COALESCE(pk.key_ordinal, 0) AS pk_ordinal
+  FROM sys.tables t JOIN sys.schemas sch ON sch.schema_id = t.schema_id
+  JOIN sys.columns c ON c.object_id = t.object_id
+  JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+  OUTER APPLY (SELECT ic.key_ordinal FROM sys.indexes i
+   JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+   WHERE i.object_id = t.object_id AND i.is_primary_key = 1 AND ic.column_id = c.column_id) pk
+  WHERE t.is_ms_shipped = 0
+    AND (
+      NOT EXISTS (SELECT 1 FROM @wanted)
+      OR EXISTS (
+        SELECT 1 FROM @wanted w
+        WHERE (w.f IS NOT NULL AND w.f = sch.name + N'.' + t.name)
+           OR (w.b IS NOT NULL AND w.b = t.name)
+      )
+    );
+END
+'@
+    PublishedColumns = @'
+IF OBJECT_ID(N'dbo.sysarticles') IS NOT NULL
+ SELECT p.name AS publication, a.name AS article, c.name AS column_name, CAST(a.schema_option AS bigint) AS schema_option
+ FROM dbo.syspublications p JOIN dbo.sysarticles a ON a.pubid = p.pubid
+ JOIN dbo.sysarticlecolumns ac ON ac.artid = a.artid
+ JOIN sys.columns c ON c.object_id = a.objid AND c.column_id = ac.colid;
+ELSE SELECT CAST(NULL AS sysname) AS publication, CAST(NULL AS sysname) AS article,
+ CAST(NULL AS sysname) AS column_name, CAST(NULL AS bigint) AS schema_option WHERE 1 = 0;
+'@
     RowCounts  = @'
 SET NOCOUNT ON;
 SELECT s.name AS sch, t.name AS tbl, SUM(p.rows) AS row_count
@@ -1097,8 +1171,11 @@ $collector = {
     Set-StrictMode -Version 2
     $ErrorActionPreference = 'Stop'
     $Q = $Opt.Q
+    $collectDeadline = $null
+    if ($Task.Kind -in 'live', 'detail') { $collectDeadline = [datetime]::UtcNow.AddSeconds(120) }
 
     function Invoke-Sql([string]$Database, [string]$Query, [hashtable]$Params = @{}, [switch]$Sets) {
+        if ($collectDeadline -and [datetime]::UtcNow -ge $collectDeadline) { throw 'Collector deadline exceeded (120 seconds).' }
         $csb = New-Object "$($Opt.Ns).SqlConnectionStringBuilder"
         $csb['Data Source'] = $Name
         $csb['Initial Catalog'] = $Database
@@ -1120,6 +1197,10 @@ $collector = {
             $cmd = $conn.CreateCommand()
             $cmd.CommandText = $Query
             $cmd.CommandTimeout = $Opt.QueryTimeout
+            if ($collectDeadline) {
+                $remaining = [Math]::Max(1, [int][Math]::Ceiling(($collectDeadline - [datetime]::UtcNow).TotalSeconds))
+                if ($cmd.CommandTimeout -eq 0 -or $cmd.CommandTimeout -gt $remaining) { $cmd.CommandTimeout = $remaining }
+            }
             foreach ($k in $Params.Keys) { [void]$cmd.Parameters.AddWithValue($k, $Params[$k]) }
             $rdr = $cmd.ExecuteReader()
             if ($Sets) {
@@ -1274,9 +1355,9 @@ $collector = {
         SrvName = ''; Version = ''; Edition = ''; Login = ''; Sysadmin = $false; ViewServerState = $false; Hadr = $false
         Transport = ''; Port = $null; Listeners = (New-List); AgRows = (New-List); AgDbs = (New-List); Dbs = (New-List)
         AgentService = ''; Jobs = (New-List); Profiles = (New-List); Retention = (New-List)
-        DistDbs = @(); DistOk = (New-List); RemoteDistributor = ''; DbErrors = (New-List)
+        DistDbs = @(); DistOk = (New-List); RemoteDistributor = ''; DistributorKnown = $false; LinkedServers = (New-List); LinkedServersComplete = $false; DbErrors = (New-List)
         Edges = (New-List); Articles = (New-List); Redirected = (New-List); Agents = (New-List); Pubs = (New-List); DistPubs = (New-List); DistPubsOk = $false
-        DistHealth = (New-List); DbResults = (New-List); Log = $log; Coverage = $cover
+        DistHealth = (New-List); DbResults = (New-List); SchemaResults = (New-List); Log = $log; Coverage = $cover
         Live = $null; Detail = $null; Repair = $null
     }
 
@@ -1285,7 +1366,7 @@ $collector = {
     } catch {
         $se = Get-SqlError $_
         $res.Error = $se[0]; $res.ErrorNumber = $se[1]
-        try { $res.Probe = Get-Probe $Name } catch { }
+        try { $res.Probe = Get-Probe $Name } catch { Log 'V' "  probe failed on ${Name}: $($_.Exception.Message)" }
         return [pscustomobject]$res
     }
     $res.SrvName = S $b.srv; $res.Version = S $b.ver; $res.Edition = S $b.ed; $res.Login = S $b.login_name
@@ -1295,12 +1376,48 @@ $collector = {
     if ($res.SrvName) { $who = $res.SrvName }
 
     if ($Task.Kind -eq 'test') {
-        if ($res.Hadr) { try { $res.Listeners = Get-Objs 'master' $Q.Listeners } catch { } }
-        try { $res.DistDbs = @((Invoke-Sql 'master' 'SELECT name FROM sys.databases WHERE is_distributor = 1').Rows | ForEach-Object { [string]$_.name }) } catch { }
+        if ($res.Hadr) {
+            try { $res.Listeners = Get-Objs 'master' $Q.Listeners } catch { Cover "Listener metadata on $who : $((Get-SqlError $_)[0])" }
+            try {
+                $roleQuery = $Q.AgNoDmv
+                if ($res.ViewServerState) { $roleQuery = $Q.Ag }
+                $res.AgRows = Get-Objs 'master' $roleQuery
+            } catch { Cover "AG role metadata on $who : $((Get-SqlError $_)[0])" }
+        }
+        try { $res.DistDbs = @((Invoke-Sql 'master' 'SELECT name FROM sys.databases WHERE is_distributor = 1').Rows | ForEach-Object { [string]$_.name }) } catch { Cover "Distributor database check on $who : $((Get-SqlError $_)[0])" }
+        return [pscustomobject]$res
+    }
+
+    if ($Task.Kind -eq 'schema') {
+        foreach ($database in $Task.Dbs) {
+            $columns = New-List; $published = New-List; $errorText = ''
+            try {
+                $tables = $database['Tables']
+                $tableParams = @{ '@tablesXml' = '' }
+                if ($tables -and @($tables).Count) {
+                    $sbXml = New-Object System.Text.StringBuilder '<tables>'
+                    foreach ($tblName in @($tables)) {
+                        $tn = [string]$tblName
+                        if (-not $tn) { continue }
+                        $escaped = [System.Security.SecurityElement]::Escape($tn)
+                        if ($tn.Contains('.')) { [void]$sbXml.Append("<t f=`"$escaped`"/>") }
+                        else { [void]$sbXml.Append("<t b=`"$escaped`"/>") }
+                    }
+                    [void]$sbXml.Append('</tables>')
+                    $tableParams['@tablesXml'] = $sbXml.ToString()
+                }
+                $columns = Get-Objs $database.Db $Q.TableContract $tableParams
+                if ($database.Publisher) { $published = Get-Objs $database.Db $Q.PublishedColumns }
+            } catch { $errorText = (Get-SqlError $_)[0] }
+            $res.SchemaResults.Add([pscustomobject]@{ Db = $database.Db; Columns = $columns; Published = $published; Error = $errorText })
+        }
         return [pscustomobject]$res
     }
 
     if ($Task.Kind -eq 'dbs') {
+        # One collector task targets one server. Cache successful exact COUNTs only;
+        # case-sensitive SQL keys preserve distinct identifiers and filter literals.
+        $filteredCountCache = New-Object 'System.Collections.Generic.Dictionary[string,long]' ([System.StringComparer]::Ordinal)
         foreach ($d in $Task.Dbs) {
             $counts = @{}; $pub = New-List; $err = ''; $fc = @{}
             if (-not $Task['NoCounts']) {
@@ -1310,14 +1427,55 @@ $collector = {
             }
             if ($d.Publisher -and -not $err) {
                 try { $pub = Get-Objs $d.Db $Q.PubDb } catch { Cover "Publication settings in $who/$($d.Db): $((Get-SqlError $_)[0])" }
-                # -FilteredRowCounts: the publisher rows the row filter lets through (COUNT with the article's own WHERE)
+                # -FilteredRowCounts: the publisher rows the row filter lets through (batched READ UNCOMMITTED + NOLOCK COUNT)
                 if ($Opt.FilteredCounts -and -not $Task['NoCounts']) {
+                    $pendingBatch = New-Object 'System.Collections.Generic.List[object]'
+                    $pendingMap = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::Ordinal)
+                    $articleTargets = New-Object 'System.Collections.Generic.List[object]'
                     foreach ($a in $pub) {
                         if (-not $a.filter_clause -or -not $a.src_table) { continue }
+                        $clause = [string]$a.filter_clause
+                        if (-not (Test-SqlFilterClause $clause)) {
+                            Cover "Filtered row count of $($a.publication)/$($a.article) in $who/$($d.Db): filter_clause failed validation"
+                            continue
+                        }
+                        $schEsc = ([string]$a.src_schema) -replace '\]', ']]'
+                        $tblEsc = ([string]$a.src_table) -replace '\]', ']]'
+                        $fromWhere = "FROM [$schEsc].[$tblEsc] WITH (NOLOCK) WHERE ($clause)"
+                        $cacheKey = "$(([string]$d.Db).Length):$($d.Db)|$fromWhere"
+                        $artKey = ("$($a.publication)|$($a.article)").ToUpperInvariant()
+                        $articleTargets.Add(@{ ArtKey = $artKey; CacheKey = $cacheKey; Label = "$($a.publication)/$($a.article)"; FromWhere = $fromWhere })
+                        if (-not $filteredCountCache.ContainsKey($cacheKey) -and -not $pendingMap.ContainsKey($cacheKey)) {
+                            $idx = $pendingBatch.Count
+                            $pendingMap[$cacheKey] = $idx
+                            $pendingBatch.Add(@{ Idx = $idx; CacheKey = $cacheKey; Label = "$($a.publication)/$($a.article)"; FromWhere = $fromWhere })
+                        }
+                    }
+                    for ($off = 0; $off -lt $pendingBatch.Count; $off += 50) {
+                        $end = [Math]::Min($off + 49, $pendingBatch.Count - 1)
+                        $chunk = @($pendingBatch[$off..$end])
+                        $unions = @(foreach ($item in $chunk) { "SELECT $($item.Idx) AS idx, COUNT_BIG(*) AS n $($item.FromWhere)" })
+                        $batchSql = "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;`n" + ($unions -join "`nUNION ALL`n") + ';'
                         try {
-                            $sql = "SELECT COUNT_BIG(*) AS n FROM [$(([string]$a.src_schema) -replace '\]', ']]')].[$(([string]$a.src_table) -replace '\]', ']]')] WHERE $($a.filter_clause)"
-                            $fc[("$($a.publication)|$($a.article)").ToUpperInvariant()] = [long](Invoke-Sql $d.Db $sql).Rows[0].n
-                        } catch { Cover "Filtered row count of $($a.publication)/$($a.article) in $who/$($d.Db): $((Get-SqlError $_)[0])" }
+                            foreach ($row in (Invoke-Sql $d.Db $batchSql).Rows) {
+                                $item = $pendingBatch[[int]$row.idx]
+                                $filteredCountCache[$item.CacheKey] = [long]$row.n
+                            }
+                        } catch {
+                            if ($chunk.Count -eq 1) {
+                                Cover "Filtered row count of $($chunk[0].Label) in $who/$($d.Db): $((Get-SqlError $_)[0])"
+                            } else {
+                                foreach ($item in $chunk) {
+                                    try {
+                                        $oneSql = "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SELECT COUNT_BIG(*) AS n $($item.FromWhere);"
+                                        $filteredCountCache[$item.CacheKey] = [long](Invoke-Sql $d.Db $oneSql).Rows[0].n
+                                    } catch { Cover "Filtered row count of $($item.Label) in $who/$($d.Db): $((Get-SqlError $_)[0])" }
+                                }
+                            }
+                        }
+                    }
+                    foreach ($at in $articleTargets) {
+                        if ($filteredCountCache.ContainsKey($at.CacheKey)) { $fc[$at.ArtKey] = $filteredCountCache[$at.CacheKey] }
                     }
                 }
             }
@@ -1334,7 +1492,7 @@ $collector = {
         return [pscustomobject]$res
     }
     if ($Task.Kind -eq 'live') {
-        $L = [ordered]@{ Now = $null; Subs = (New-List); Agents = (New-List); Pending = (New-List); PendingDbs = (New-List); Errors = (New-List)
+        $L = [ordered]@{ Now = $null; Subs = (New-List); Agents = (New-List); Pending = (New-List); PendingDbs = (New-List); PendingStatus = @{}; Errors = (New-List)
                          ErrMap = (New-List); ErrMax = @{}; Sessions = (New-List); SessWaits = (New-List); Waits = (New-List); WaitsOk = $false
                          Ag = (New-List); Jobs = (New-List); JobsOk = $false; Notes = (New-List) }
         $res.Live = $L
@@ -1364,10 +1522,15 @@ $collector = {
                 }
             } catch { $L.Notes.Add("Agents in $who/$db : $((Get-SqlError $_)[0])") }
             if ($d.Pending) {
+                $L.PendingDbs.Add($db)
+                $L.PendingStatus[$db] = @{ At = Get-Date; Error = ''; Ok = $false }
                 try {
                     foreach ($r in (Invoke-Sql $db $Q.LivePending).Rows) { $o = ConvertTo-Obj $r; $o | Add-Member -NotePropertyName Db -NotePropertyValue $db; $L.Pending.Add($o) }
-                    $L.PendingDbs.Add($db)
-                } catch { $L.Notes.Add("Pending commands in $who/$db : $((Get-SqlError $_)[0])") }
+                    $L.PendingStatus[$db].Ok = $true
+                } catch {
+                    $L.PendingStatus[$db].Error = (Get-SqlError $_)[0]
+                    $L.Notes.Add("Pending commands in $who/$db : $($L.PendingStatus[$db].Error)")
+                }
             }
         }
         if ($Task.SessionSql) {
@@ -1511,15 +1674,20 @@ $collector = {
     }
     try { $res.Jobs = Get-Objs 'msdb' $Q.Jobs } catch { Cover "Replication agent jobs on $who (msdb): $((Get-SqlError $_)[0])" }
     try { $res.Profiles = Get-Objs 'msdb' $Q.Profiles } catch { Cover "Agent profiles on $who (msdb): $((Get-SqlError $_)[0])" }
-    try { $res.Retention = Get-Objs 'msdb' $Q.Retention } catch { }
+    try { $res.Retention = Get-Objs 'msdb' $Q.Retention } catch { Cover "Distribution retention on $who (msdb): $((Get-SqlError $_)[0])" }
 
     try {
         $res.DistDbs = @((Invoke-Sql 'master' 'SELECT name FROM sys.databases WHERE is_distributor = 1 AND state = 0').Rows | ForEach-Object { [string]$_.name })
     } catch { Log 'V' "  sys.databases: $($_.Exception.Message)" }
     try {
         $gd = Invoke-Sql 'master' 'EXEC sp_get_distributor'
+        $res.DistributorKnown = $true
         if ($gd.Rows.Count -gt 0 -and $gd.Rows[0][0] -eq 1) { $res.RemoteDistributor = S $gd.Rows[0][1] }
     } catch { Log 'V' "  sp_get_distributor: $($_.Exception.Message)" }
+    try {
+        $res.LinkedServers = Get-Objs 'master' $Q.LinkedServers
+        $res.LinkedServersComplete = $res.Sysadmin
+    } catch { Cover "Linked server metadata on $who : $((Get-SqlError $_)[0])" }
     if ($res.DistDbs.Count -gt 0) {
         # publishers registered at this distributor (every replica of a published AG database has to be one)
         try { $res.DistPubs = Get-Objs 'msdb' $Q.DistPubs; $res.DistPubsOk = $true }
@@ -1569,11 +1737,13 @@ $collector = {
         # Pending commands need sysadmin or db_owner in the distribution database
         $canPending = $false
         if (-not $Opt.NoHealth -and -not $Opt.NoPending) {
+            $pendingPermissionRead = $false
             try {
                 $pp = (Invoke-Sql $db $Q.Perm).Rows[0]
                 $canPending = ((V $pp 'sa') -eq 1 -or (V $pp 'dbo') -eq 1)
-            } catch { }
-            if (-not $canPending) {
+                $pendingPermissionRead = $true
+            } catch { Cover "Pending permission probe failed in $who/$db : $((Get-SqlError $_)[0])" }
+            if ($pendingPermissionRead -and -not $canPending) {
                 Cover "Pending commands in $who/$db : the login $($res.Login) needs sysadmin or db_owner in the distribution database"
                 Log 'W' "  Pending commands skipped in $db : the login needs sysadmin or db_owner"
             }
@@ -1644,7 +1814,7 @@ $collector = {
         try {
             foreach ($a in (Invoke-Sql $db $Q.Articles).Rows) {
                 $res.Articles.Add([pscustomobject]@{
-                    PubServerRaw = S (V $a 'pub_server'); PubDb = S (V $a 'pub_db'); Publication = S (V $a 'publication')
+                    DistDb = $db; PubServerRaw = S (V $a 'pub_server'); PubDb = S (V $a 'pub_db'); Publication = S (V $a 'publication')
                     Article = S (V $a 'article'); Source = S (V $a 'source_object'); Destination = S (V $a 'destination_object')
                 })
             }
@@ -1711,33 +1881,81 @@ function Get-Prop($Obj, [string]$Name) {
 }
 
 # JSON writer (same output in PowerShell 5.1 and 7; '<' escaped so it is safe inside <script>)
-function ConvertTo-JsonText($o) {
-    if ($null -eq $o -or $o -is [DBNull]) { return 'null' }
+$jsonEscRx = New-Object System.Text.RegularExpressions.Regex('[\\"\u0000-\u001f<>&  ]', 'Compiled')
+$jsonEscFn = [System.Text.RegularExpressions.MatchEvaluator]{
+    param($m)
+    if ($m.Value -eq '\') { '\\' } elseif ($m.Value -eq '"') { '\"' } else { '\u{0:x4}' -f [int][char]$m.Value }
+}
+function Write-JsonText([System.Text.StringBuilder]$sb, $o) {
+    if ($null -eq $o -or $o -is [DBNull]) { [void]$sb.Append('null'); return }
     if ($o -is [string] -or $o -is [char] -or $o -is [datetime]) {
         if ($o -is [datetime]) { $o = $o.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) }
-        $s = [regex]::Replace([string]$o, '[\\"\u0000-\u001f<>&\u2028\u2029]', [System.Text.RegularExpressions.MatchEvaluator]{
-            param($m)
-            if ($m.Value -eq '\') { '\\' } elseif ($m.Value -eq '"') { '\"' } else { '\u{0:x4}' -f [int][char]$m.Value }
-        })
-        return '"' + $s + '"'
+        $s = [string]$o
+        if ($jsonEscRx.IsMatch($s)) { $s = $jsonEscRx.Replace($s, $jsonEscFn) }
+        [void]$sb.Append('"').Append($s).Append('"'); return
     }
-    if ($o -is [bool]) { if ($o) { return 'true' } else { return 'false' } }
-    if ($o -is [ValueType]) { return ([IFormattable]$o).ToString($null, [Globalization.CultureInfo]::InvariantCulture) }
+    if ($o -is [bool]) { if ($o) { [void]$sb.Append('true') } else { [void]$sb.Append('false') }; return }
+    if ($o -is [ValueType]) { [void]$sb.Append(([IFormattable]$o).ToString($null, [Globalization.CultureInfo]::InvariantCulture)); return }
     if ($o -is [System.Collections.IDictionary]) {
-        $parts = foreach ($k in $o.Keys) { (ConvertTo-JsonText ([string]$k)) + ':' + (ConvertTo-JsonText $o[$k]) }
-        return '{' + (@($parts) -join ',') + '}'
+        [void]$sb.Append('{'); $first = $true
+        foreach ($k in $o.Keys) { if ($first) { $first = $false } else { [void]$sb.Append(',') }; Write-JsonText $sb ([string]$k); [void]$sb.Append(':'); Write-JsonText $sb $o[$k] }
+        [void]$sb.Append('}'); return
     }
     if ($o -is [System.Collections.IEnumerable]) {
-        $parts = foreach ($x in $o) { ConvertTo-JsonText $x }
-        return '[' + (@($parts) -join ',') + ']'
+        [void]$sb.Append('['); $first = $true
+        foreach ($x in $o) { if ($first) { $first = $false } else { [void]$sb.Append(',') }; Write-JsonText $sb $x }
+        [void]$sb.Append(']'); return
     }
-    $parts = foreach ($p in $o.PSObject.Properties) { (ConvertTo-JsonText $p.Name) + ':' + (ConvertTo-JsonText $p.Value) }
-    return '{' + (@($parts) -join ',') + '}'
+    [void]$sb.Append('{'); $first = $true
+    foreach ($p in $o.PSObject.Properties) { if ($first) { $first = $false } else { [void]$sb.Append(',') }; Write-JsonText $sb $p.Name; [void]$sb.Append(':'); Write-JsonText $sb $p.Value }
+    [void]$sb.Append('}')
 }
+function ConvertTo-JsonText($o) { $sb = New-Object System.Text.StringBuilder; Write-JsonText $sb $o; return $sb.ToString() }
 
 function Esc-Mmd([string]$s) { return ($s -replace '"', '#34;' -replace '<', '#60;' -replace '>', '#62;') }
 function Esc-Dot([string]$s) { return ($s -replace '\\', '\\' -replace '"', '\"') }
 function Enc-Html([string]$s) { return [System.Net.WebUtility]::HtmlEncode($s) }
+
+# Publish each file by a rename on the same filesystem. The manifest is committed last.
+function Move-AtomicReportFile([string]$Source, [string]$Destination) {
+    if (-not [IO.File]::Exists($Destination)) { [IO.File]::Move($Source, $Destination); return }
+    $backup = $Destination + '.' + [guid]::NewGuid().ToString('N') + '.bak'
+    try { [IO.File]::Replace($Source, $Destination, $backup) }
+    finally { if ([IO.File]::Exists($backup)) { [IO.File]::Delete($backup) } }
+}
+function Write-AtomicText([string]$Path, [string]$Text) {
+    $temp = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        [IO.File]::WriteAllText($temp, $Text, (New-Object Text.UTF8Encoding $false))
+        Move-AtomicReportFile $temp $Path
+    } finally { if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) } }
+}
+function Start-ReportRun([string]$Destination) {
+    $destinationPath = [IO.Path]::GetFullPath($Destination)
+    [void][IO.Directory]::CreateDirectory($destinationPath)
+    $id = [guid]::NewGuid().ToString('N')
+    $stage = Join-Path $destinationPath ('.run-' + $id)
+    [void][IO.Directory]::CreateDirectory($stage)
+    Write-AtomicText (Join-Path $destinationPath 'report-manifest.json') (ConvertTo-JsonText ([ordered]@{ schema = 1; run = $id; status = 'running'; files = @() }))
+    return @{ Id = $id; Destination = $destinationPath; Stage = $stage }
+}
+function Complete-ReportRun($Run) {
+    $files = @()
+    foreach ($file in (Get-ChildItem -LiteralPath $Run.Stage -File | Sort-Object Name)) {
+        $target = Join-Path $Run.Destination $file.Name
+        Move-AtomicReportFile $file.FullName $target
+        $files += [ordered]@{ name = $file.Name; sha256 = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash; bytes = (Get-Item -LiteralPath $target).Length }
+    }
+    # Only fixed, tool-owned artifacts can be removed; user files and old AI exports stay.
+    foreach ($name in 'connections.csv', 'edges.csv', 'articles.csv', 'findings.csv', 'rowcounts.csv', 'changes.csv', 'servers.csv', 'ag-readiness.csv', 'article-contracts.csv', 'repairs.sql', 'topology.mmd', 'topology.dot', 'topology.json', 'topology.html', 'topology.pdf') {
+        if ($name -notin @($files | ForEach-Object { $_.name })) {
+            $path = Join-Path $Run.Destination $name
+            if ([IO.File]::Exists($path)) { [IO.File]::Delete($path) }
+        }
+    }
+    Write-AtomicText (Join-Path $Run.Destination 'report-manifest.json') (ConvertTo-JsonText ([ordered]@{ schema = 1; run = $Run.Id; status = 'complete'; files = $files }))
+    [IO.Directory]::Delete($Run.Stage, $false)
+}
 
 # CSV for Excel: list separator of the regional settings, UTF-8 with BOM
 function Export-ReportCsv($Rows, [string]$File) {
@@ -1745,7 +1963,21 @@ function Export-ReportCsv($Rows, [string]$File) {
     $enc = 'UTF8'
     if ($PSVersionTable.PSVersion.Major -ge 6) { $enc = 'utf8BOM' }
     $list = @($Rows | Where-Object { $null -ne $_ })
-    if ($list.Count -eq 0) { return }
+    if ($list.Count -eq 0) {
+        $path = Join-Path $OutputDir $File
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -ErrorAction Stop }
+        return
+    }
+    # a cell starting with = + - @ would run as a formula in Excel: prefix an apostrophe (on copies, the model stays as it is)
+    $list = @(foreach ($r in $list) {
+        $o = [ordered]@{}
+        foreach ($p in $r.PSObject.Properties) {
+            $v = $p.Value
+            if ($v -is [string] -and $v -match '^[=+\-@\t\r]' -and $v -notmatch '^[+-]?\d[\d.,]*$') { $v = "'" + $v }
+            $o[$p.Name] = $v
+        }
+        [pscustomobject]$o
+    })
     $list | Export-Csv -LiteralPath (Join-Path $OutputDir $File) -NoTypeInformation -Encoding $enc -UseCulture
 }
 
@@ -1919,8 +2151,29 @@ function Get-Target([string]$Canon) {
     return $Canon
 }
 
+function Test-SqlFilterClause {
+    param([string]$Clause)
+    if ([string]::IsNullOrWhiteSpace($Clause)) { return $false }
+    # Remove SQL string literals (N'...' or '...' with '' escapes); reject unclosed quotes
+    $stripped = [regex]::Replace($Clause, "(?i)(?:N)?'(?:''|[^'])*'", ' ')
+    if ($stripped.Contains("'")) { return $false }
+    # Reject statement terminators, comments, and multi-statement tokens outside string literals
+    if ($stripped -match ';|--|/\*|\*/') { return $false }
+    # Remove well-formed bracketed identifiers ([col] with ]] escapes); reject stray brackets
+    $noBrackets = [regex]::Replace($stripped, '\[(?:[^\]]|\]\])*\]', ' ')
+    if ($noBrackets.Contains('[') -or $noBrackets.Contains(']')) { return $false }
+    # Reject DML/DDL, dynamic execution, external rowsets, delay/lock tricks, UNION/INTO, and system/extended procs
+    if ($noBrackets -match '(?i)\b(?:INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|CREATE|TRUNCATE|EXEC|EXECUTE|WAITFOR|OPENROWSET|OPENDATASOURCE|OPENQUERY|OPENDATASET|BULK|GRANT|REVOKE|DENY|SHUTDOWN|DBCC|BACKUP|RESTORE|RECONFIGURE|INTO|UNION)\b|\b(?:xp|sp)_[A-Za-z0-9_]*') {
+        return $false
+    }
+    return $true
+}
+
 # Runs the collector for several servers (in parallel when possible); calls $OnResult as each one finishes
+$collectHelper = "function Test-SqlFilterClause {`n$(${function:Test-SqlFilterClause}.ToString())`n}`n"
+$collectParamEnd = $collector.Ast.ParamBlock.Extent.EndOffset - $collector.Ast.Extent.StartOffset - 1
 $collectText = $collector.ToString()
+$collectText = $collectText.Substring(0, $collectParamEnd) + "`n$collectHelper" + $collectText.Substring($collectParamEnd)
 function Invoke-Collect([object[]]$Items, [string]$OnResult, [string]$Activity) {
     if ($Items.Count -eq 0) { return }
     if ($ThrottleLimit -le 1 -or $Items.Count -eq 1) {
@@ -2027,12 +2280,19 @@ function Get-BrowserInstances([string[]]$Hosts, [int]$WaitMs = 2500) {
         } else {
             [void]$udp.Send([byte[]](2), 1, (New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Broadcast), 1434))
         }
+        # -ScanHost: only the asked hosts may answer (a stranger on the network could otherwise get listed and later receive the login)
+        $allowed = @{}
+        foreach ($h in $Hosts) {
+            try { foreach ($ad in [System.Net.Dns]::GetHostAddresses($h)) { $allowed[$ad.ToString()] = $true } }
+            catch { Write-Warning "Could not resolve host '$h' for SQL Browser reply filtering: $($_.Exception.Message)" }
+        }
         $end = (Get-Date).AddMilliseconds($WaitMs)
         while ((Get-Date) -lt $end) {
             if ($udp.Available -le 0) { Start-Sleep -Milliseconds 50; continue }
             $from = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any), 0
             try { $data = $udp.Receive([ref]$from) } catch { continue }   # e.g. ICMP "port unreachable" from a host without Browser
             if ($data.Length -lt 4 -or $data[0] -ne 5) { continue }
+            if ($Hosts -and $allowed.Count -gt 0 -and -not $allowed.ContainsKey($from.Address.ToString())) { continue }
             foreach ($rec in ([System.Text.Encoding]::ASCII.GetString($data, 3, $data.Length - 3) -split ';;')) {
                 $kv = @{}; $parts = $rec -split ';'
                 for ($i = 0; $i + 1 -lt $parts.Count; $i += 2) { $kv[$parts[$i]] = $parts[$i + 1] }
@@ -2068,7 +2328,7 @@ if ($Scan -or $ScanHost) {
         for ($i = 0; $i -lt $found.Count; $i++) {
             $x = $found[$i]; $year = ''
             if ($x.Version) { $year = Get-SqlYear $x.Version }
-            Write-Host ('  {0,3}  {1,-40} {2,6}  {3,-9} {4}' -f ($i + 1), $x.Server, $x.Port, $year, $x.Note)
+            Write-Host ('  {0,3}  {1,-40} {2,6}  {3,-9} {4}' -f ($i + 1), ($x.Server -replace '[\x00-\x1f\x7f]', ' '), $x.Port, $year, ($x.Note -replace '[\x00-\x1f\x7f]', ' '))
         }
         $redirected = $false
         try { $redirected = [Console]::IsInputRedirected } catch { }
@@ -2100,7 +2360,16 @@ if ($Servers.Count -eq 1 -and (Test-Path -LiteralPath $Servers[0] -PathType Leaf
 $seen = @{}
 $Servers = @(foreach ($s in $Servers) { if (-not $seen.ContainsKey($s.ToUpperInvariant())) { $seen[$s.ToUpperInvariant()] = $true; $s } })
 if ($Servers.Count -eq 0) { throw 'No servers given: use -Servers <names or a list file>, -Scan or -ScanHost <hosts>.' }
-if (-not $Monitor) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
+$reportRun = $null
+if (-not $Monitor) {
+    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+    if (-not $TestOnly) {
+        # Resolve before OutputDir switches to staging, including CompareTo = OutputDir.
+        if ($CompareTo) { $CompareTo = [IO.Path]::GetFullPath($CompareTo) }
+        $reportRun = Start-ReportRun $OutputDir
+        $OutputDir = $reportRun.Stage
+    }
+}
 
 function Add-TestResult($it, $r, $secs, $live) {
     $tests.Add([pscustomobject]@{ Entry = $it.Target; R = $r; Ms = [int]($secs * 1000) })
@@ -2110,6 +2379,7 @@ Invoke-Collect @($Servers | ForEach-Object { @{ Key = $_; Target = $_; Task = @{
 
 $connRows = New-Object System.Collections.Generic.List[object]
 $okStarts = New-Object System.Collections.Generic.List[string]
+$startsDone = $false; $warnedCrawl = $false
 foreach ($s in $Servers) {
     $t = $tests | Where-Object { $_.Entry -eq $s } | Select-Object -First 1
     if (-not $t) { continue }
@@ -2164,6 +2434,10 @@ function Add-Server([string]$Name) {
     $n = Resolve-Name $raw
     if ($queued.ContainsKey($n)) { return }
     $queued[$n] = $true
+    if ($startsDone -and $SqlCredential -and -not ($Encrypt -eq 'Strict' -or ($StrictCert -and $Encrypt -eq 'Mandatory')) -and -not $warnedCrawl) {
+        $script:warnedCrawl = $true
+        Write-Warning 'The SQL login password is also sent to servers found in replication metadata (certificates are not validated). Use -NoCrawl to restrict targets, or -Encrypt Mandatory -StrictCert to validate transport.'
+    }
     if ($connectFor.ContainsKey($n)) { $connectName[$n] = $connectFor[$n] } else { $connectName[$n] = $Name.Trim() }
     $queue.Enqueue($n)
 }
@@ -2219,11 +2493,12 @@ function Merge-Result($it, $r, $secs, $live) {
         Publications = 0; Error = ($r.DbErrors -join ' '); Support = ''; UpgradeLimit = ''
         Dbs = $dbIdx; Jobs = $r.Jobs; Profiles = $r.Profiles; Retention = $r.Retention; DistHealth = $r.DistHealth
         DistPubs = $r.DistPubs; DistPubsOk = $r.DistPubsOk
+        DistributorKnown = $r.DistributorKnown; ConfiguredDistributor = $r.RemoteDistributor; LinkedServers = $r.LinkedServers; LinkedServersComplete = $r.LinkedServersComplete
     }
     $serverInfo[$real] = $info
     if ($r.RemoteDistributor -and (Resolve-Name (Get-NormName $r.RemoteDistributor)) -ne $real) {
         $info.RemoteDistributor = $r.RemoteDistributor
-        Add-Server $r.RemoteDistributor
+        if (-not $NoCrawl) { Add-Server $r.RemoteDistributor }
     }
     foreach ($x in $r.Redirected) {
         $orig = Get-NormName $x.Original; $ln = Get-NormName $x.Listener
@@ -2244,10 +2519,11 @@ function Merge-Result($it, $r, $secs, $live) {
             if ($e.SubServerRaw) { Add-Server (Get-CrawlName $e.SubServerRaw $e.SubDb) }
         }
     }
-    foreach ($a in $r.Articles) { $articles.Add($a) }
+    foreach ($a in $r.Articles) { $a | Add-Member -NotePropertyName DistInst -NotePropertyValue $real -Force; $articles.Add($a) }
 }
 
 foreach ($s in $okStarts) { Add-Server $s }
+$startsDone = $true
 
 while ($true) {
     # A failed server is tried once more when a working connection string was learned meanwhile
@@ -2313,7 +2589,7 @@ $articles = @(foreach ($a in $articles) {
     $pk = ("$pubServer|$($a.PubDb)|$($a.Publication)").ToUpperInvariant()
     if (-not $artSeen.Add("$pk|$($a.Article)".ToUpperInvariant())) { continue }
     $obj = [pscustomobject]@{ PubKey = $pk; PubServer = $pubServer; PubDb = $a.PubDb; Publication = $a.Publication
-                              Article = $a.Article; Source = $a.Source; Destination = $a.Destination; Change = '' }
+                              Article = $a.Article; Source = $a.Source; Destination = $a.Destination; Change = ''; DistInst = [string]$a.DistInst; DistDb = [string]$a.DistDb }
     if (-not $artByPub.ContainsKey($pk)) { $artByPub[$pk] = New-Object System.Collections.Generic.List[object] }
     $artByPub[$pk].Add($obj)
     $obj
@@ -2338,36 +2614,65 @@ foreach ($g in ($edges | Group-Object PubServer)) {
     }
 }
 
-$agentIdx = @{}; $logReaderIdx = @{}; $jobIdx = @{}; $pullJobIdx = @{}; $profileIdx = @{}; $knownJobs = @{}
+# Distribution agent IDs and names are scoped to a distribution database.
+function Get-ReplAgentKey([string]$Instance, [string]$Database, [string]$Kind, [string]$Id) {
+    return "$Instance|$Database|$Kind|$Id".ToUpperInvariant()
+}
+function New-ReplAgentIndexes($Rows) {
+    $byId = @{}; $readers = @{}; $byName = @{}
+    foreach ($agent in $Rows) {
+        $key = Get-ReplAgentKey $agent.DistInst $agent.DistDb $agent.kind $agent.agent_id
+        $byId[$key] = $agent
+        if ($agent.kind -eq 'L') {
+            $readers["$($agent.DistInst)|$($agent.DistDb)|$(Get-NormName ([string]$agent.publisher))|$(([string]$agent.publisher_db).ToUpperInvariant())"] = $agent
+        }
+        if ($agent.name) {
+            $nameKey = "$($agent.DistInst)|$($agent.DistDb)|$($agent.name)".ToUpperInvariant()
+            if ($byName.ContainsKey($nameKey) -and $byName[$nameKey] -ne $key) { $byName[$nameKey] = '' }
+            else { $byName[$nameKey] = $key }
+        }
+    }
+    return @{ Agents = $byId; LogReaders = $readers; Names = $byName }
+}
+
+function Register-PullJob([string]$Server, $Job) {
+    $ja = $Job.Args
+    if ($Job.category -eq 'REPL-Distribution' -and $ja.ContainsKey('PUBLICATION') -and $ja.ContainsKey('SUBSCRIBERDB') -and $ja.ContainsKey('PUBLISHER') -and $ja.ContainsKey('PUBLISHERDB')) {
+        $script:pullJobIdx[("$Server|$(Get-NormName $ja['PUBLISHER'])|$($ja['PUBLISHERDB'])|$($ja['PUBLICATION'])|$($ja['SUBSCRIBERDB'])").ToUpperInvariant()] = $Job
+    }
+}
+$agentIndexes = New-ReplAgentIndexes $agents
+$agentIdx = $agentIndexes.Agents; $logReaderIdx = $agentIndexes.LogReaders; $jobIdx = @{}; $pullJobIdx = @{}; $profileIdx = @{}; $knownJobs = @{}
 foreach ($a in $agents) {
-    $agentIdx["$($a.DistInst)|$($a.kind)|$($a.agent_id)"] = $a
-    if ($a.kind -eq 'L') { $logReaderIdx["$($a.DistInst)|$(Get-NormName ([string]$a.publisher))|$(([string]$a.publisher_db).ToUpperInvariant())"] = $a }
     if ($a.job_id) { $knownJobs["$($a.DistInst)|$(([string]$a.job_id).ToUpperInvariant())"] = $true }
+}
+# Parsed command line of an agent job (Args, SkipErrors, encryption level) and the profile parameters of a server: shared by the crawl and the monitor refresh
+function Add-JobMetadata([string]$Server, $Job) {
+    $ja = Get-AgentArgs ([string]$Job.command)
+    $Job | Add-Member -NotePropertyName Args -NotePropertyValue $ja -Force
+    $Job | Add-Member -NotePropertyName Server -NotePropertyValue $Server -Force
+    $Job | Add-Member -NotePropertyName Continuous -NotePropertyValue ($ja.ContainsKey('CONTINUOUS')) -Force
+    $skip = ''
+    if ($ja.ContainsKey('SKIPERRORS')) { $skip = $ja['SKIPERRORS'] }
+    $Job | Add-Member -NotePropertyName SkipErrors -NotePropertyValue $skip -Force
+    $enc = ''
+    if ($ja.ContainsKey('ENCRYPTIONLEVEL')) { $enc = $ja['ENCRYPTIONLEVEL'] }
+    $Job | Add-Member -NotePropertyName EncLevel -NotePropertyValue $enc -Force
+    $script:jobIdx["$Server|$(([string]$Job.job_id).ToUpperInvariant())"] = $Job
+    Register-PullJob $Server $Job
+}
+function Add-ProfileMetadata([string]$Server, $Profiles) {
+    foreach ($p in $Profiles) {
+        $k = "$Server|$($p.profile_id)"
+        if (-not $script:profileIdx.ContainsKey($k)) { $script:profileIdx[$k] = @{ Name = [string]$p.profile_name; SkipErrors = ''; EncLevel = '' } }
+        if ([string]$p.parameter_name -match '(?i)SkipErrors') { $script:profileIdx[$k].SkipErrors = [string]$p.value }
+        if ([string]$p.parameter_name -match '(?i)EncryptionLevel') { $script:profileIdx[$k].EncLevel = [string]$p.value }
+    }
 }
 foreach ($srv in @($serverInfo.Keys)) {
     $info = $serverInfo[$srv]
-    foreach ($j in $info.Jobs) {
-        $ja = Get-AgentArgs ([string]$j.command)
-        $j | Add-Member -NotePropertyName Args -NotePropertyValue $ja
-        $j | Add-Member -NotePropertyName Server -NotePropertyValue $srv
-        $j | Add-Member -NotePropertyName Continuous -NotePropertyValue ($ja.ContainsKey('CONTINUOUS'))
-        $skip = ''
-        if ($ja.ContainsKey('SKIPERRORS')) { $skip = $ja['SKIPERRORS'] }
-        $j | Add-Member -NotePropertyName SkipErrors -NotePropertyValue $skip
-        $enc = ''
-        if ($ja.ContainsKey('ENCRYPTIONLEVEL')) { $enc = $ja['ENCRYPTIONLEVEL'] }
-        $j | Add-Member -NotePropertyName EncLevel -NotePropertyValue $enc
-        $jobIdx["$srv|$(([string]$j.job_id).ToUpperInvariant())"] = $j
-        if ($j.category -eq 'REPL-Distribution' -and $ja.ContainsKey('PUBLICATION') -and $ja.ContainsKey('SUBSCRIBERDB') -and $ja.ContainsKey('PUBLISHER') -and $ja.ContainsKey('PUBLISHERDB')) {
-            $pullJobIdx[("$srv|$(Get-NormName $ja['PUBLISHER'])|$($ja['PUBLISHERDB'])|$($ja['PUBLICATION'])|$($ja['SUBSCRIBERDB'])").ToUpperInvariant()] = $j
-        }
-    }
-    foreach ($p in $info.Profiles) {
-        $k = "$srv|$($p.profile_id)"
-        if (-not $profileIdx.ContainsKey($k)) { $profileIdx[$k] = @{ Name = [string]$p.profile_name; SkipErrors = ''; EncLevel = '' } }
-        if ([string]$p.parameter_name -match '(?i)SkipErrors') { $profileIdx[$k].SkipErrors = [string]$p.value }
-        if ([string]$p.parameter_name -match '(?i)EncryptionLevel') { $profileIdx[$k].EncLevel = [string]$p.value }
-    }
+    foreach ($j in $info.Jobs) { Add-JobMetadata $srv $j }
+    Add-ProfileMetadata $srv $info.Profiles
 }
 
 # ---------------------------------------------------------------------------
@@ -2385,21 +2690,29 @@ function Get-JobState($Job, [string]$HomeServer) {
     if ($Job.Server -ne $HomeServer) { $s += "on $($Job.Server)" }
     return ($s -join ', ')
 }
+# The Distribution Agent job of a pull subscription lives at the subscriber; it is found by the publication in its command line
+function Find-PullJob($Edge) {
+    foreach ($inst in (Get-Instances $Edge.SubServer)) {
+        $pk = ("$inst|$(Get-NormName $Edge.PubServerRaw)|$($Edge.PubDb)|$($Edge.Publication)|$($Edge.SubDb)").ToUpperInvariant()
+        if ($script:pullJobIdx.ContainsKey($pk)) { return [pscustomobject]@{ Job = $script:pullJobIdx[$pk]; Server = $inst } }
+    }
+    return $null
+}
 $runText = @{ 1 = 'Started'; 2 = 'Succeeded'; 3 = 'In progress'; 4 = 'Idle'; 5 = 'Retrying'; 6 = 'Failed' }
 
 foreach ($e in $edges) {
     if (-not $e.SubServer -or $NoHealth) { continue }
     $di = $e.DistributorInstance
     $ag = $null
+    $kind = 'D'
+    if ($e.PubType -eq 'Merge') { $kind = 'M' }
     if ($e.AgentId) {
-        $kind = 'D'
-        if ($e.PubType -eq 'Merge') { $kind = 'M' }
-        $k = "$di|$kind|$($e.AgentId)"
+        $k = "$di|$($e.DistributionDb)|$kind|$($e.AgentId)"
         if ($agentIdx.ContainsKey($k)) { $ag = $agentIdx[$k] }
     }
     if (-not $ag) {
         $ag = $agents | Where-Object {
-            $_.DistInst -eq $di -and $_.kind -eq 'D' -and (Get-NormName ([string]$_.publisher)) -eq (Get-NormName $e.PubServerRaw) -and
+            $_.DistInst -eq $di -and $_.DistDb -eq $e.DistributionDb -and $_.kind -eq $kind -and (Get-NormName ([string]$_.publisher)) -eq (Get-NormName $e.PubServerRaw) -and
             [string]$_.publisher_db -eq $e.PubDb -and ([string]$_.publication -eq $e.Publication -or [string]$_.publication -eq 'ALL') -and
             (Get-NormName ([string]$_.subscriber)) -eq (Get-NormName $e.SubServerRaw) -and [string]$_.subscriber_db -eq $e.SubDb
         } | Select-Object -First 1
@@ -2412,10 +2725,8 @@ foreach ($e in $edges) {
             if ($jobIdx.ContainsKey($jk)) { $job = $jobIdx[$jk]; $jobSrv = $di }
         }
         if (-not $job) {
-            foreach ($inst in (Get-Instances $e.SubServer)) {
-                $pk = ("$inst|$(Get-NormName $e.PubServerRaw)|$($e.PubDb)|$($e.Publication)|$($e.SubDb)").ToUpperInvariant()
-                if ($pullJobIdx.ContainsKey($pk)) { $job = $pullJobIdx[$pk]; $jobSrv = $inst; break }
-            }
+            $pull = Find-PullJob $e
+            if ($pull) { $job = $pull.Job; $jobSrv = $pull.Server }
         }
         $prof = $null
         if ($profileIdx.ContainsKey("$di|$($ag.profile_id)")) { $prof = $profileIdx["$di|$($ag.profile_id)"] }
@@ -2442,7 +2753,7 @@ foreach ($e in $edges) {
         if ($ag.retries -ge 10) { Add-Problem $e 'warn' "$($ag.retries) RETRIES IN $HistoryHours H" }
     }
     if ($e.PubType -eq 'Transactional' -or $e.PubType -eq 'P2P') {
-        $lk = "$di|$(Get-NormName $e.PubServerRaw)|$($e.PubDb.ToUpperInvariant())"
+        $lk = "$di|$($e.DistributionDb)|$(Get-NormName $e.PubServerRaw)|$($e.PubDb.ToUpperInvariant())"
         if ($logReaderIdx.ContainsKey($lk)) {
             $lr = $logReaderIdx[$lk]
             $lj = $null
@@ -2492,7 +2803,10 @@ $logReaderRows = @(@(foreach ($lr in $logReaderIdx.Values) {
     if ($null -ne $lr.max_latency) { $maxLat = [math]::Round($lr.max_latency / 1000, 1) }
     $jobKey = ''
     if ($lj) { $jobKey = $jk }
-    [pscustomobject]@{ Distributor = $lr.DistInst; Publisher = $pub; PubDb = [string]$lr.publisher_db; Status = $status; Health = $lvl; LastRun = $last; JobKey = $jobKey
+    $lrProblems = New-Object System.Collections.Generic.List[string]
+    if ($lj -and -not $lj.enabled) { $lrProblems.Add('AGENT JOB DISABLED') } elseif ($lj -and $lj.Continuous -and -not $lj.running) { $lrProblems.Add('AGENT NOT RUNNING') }
+    if ($lr.runstatus -eq 6) { $lrProblems.Add('AGENT FAILED') } elseif ($lr.fails -gt 0) { $lrProblems.Add("AGENT FAILURES $($lr.fails)") }
+    [pscustomobject]@{ Distributor = $lr.DistInst; Publisher = $pub; PubDb = [string]$lr.publisher_db; Status = $status; Health = $lvl; LastRun = $last; JobKey = $jobKey; Problem = ($lrProblems -join ', ')
                        Job = $state; Fails = $lr.fails; Retries = $lr.retries; MaxLatencySec = $maxLat; Message = (($msg -replace '\s+', ' ').Trim()) }
 }) | Sort-Object Publisher, PubDb)
 
@@ -2589,11 +2903,12 @@ if (-not $NoRowCounts) {
             if ($filtered) { $note += 'filtered article (difference expected)' }
             if ($e.PubType -eq 'Snapshot') { $note += 'snapshot publication (refreshed on schedule)' }
             if ($e.Pending -gt 0) { $note += "$($e.Pending) commands pending" }
+            if ($null -eq $e.Pending) { $note += 'pending unknown; row comparison is indicative' }
             # ponytail: fixed tolerance (10 rows / 0.1%); make it a parameter if busy tables give false alarms
             $tol = 10
             if ($null -ne $pc) { $tol = [math]::Max(10, [math]::Ceiling($pc * 0.001)) }
             if ($e.StatusText -and $e.StatusText -ne 'Active') { $note += "subscription $($e.StatusText.ToLower()) (not initialized yet)" }
-            $bad = (-not $filtered -and $e.PubType -ne 'Snapshot' -and ($e.StatusText -eq 'Active' -or -not $e.StatusText) -and -not ($e.Pending -gt 0) -and (($null -eq $sc) -or ($null -ne $diff -and [math]::Abs($diff) -gt $tol)))
+            $bad = (-not $filtered -and $e.PubType -ne 'Snapshot' -and ($e.StatusText -eq 'Active' -or -not $e.StatusText) -and $null -ne $e.Pending -and $e.Pending -eq 0 -and (($null -eq $sc) -or ($null -ne $diff -and [math]::Abs($diff) -gt $tol)))
             if ($bad) { $drift.Add("$($a.Destination) (publisher $pc, subscriber $sc)") }
             $rowCountRows.Add([pscustomobject]@{
                 Publication = $e.Publication; Article = $a.Article; Publisher = "$($e.PubServer)/$($e.PubDb)"; Source = $a.Source; PublisherRows = $pc
@@ -2625,7 +2940,145 @@ foreach ($a in $articles) {
     if ($a.PSObject.Properties['PubServer']) { $f = $artFilter["$($a.PubServer)|$($a.PubDb)|$($a.Publication)|$($a.Article)".ToUpperInvariant()] }
     $a | Add-Member -NotePropertyName RowFilter -NotePropertyValue $(if ($f) { $f.Rows } else { '' }) -Force
     $a | Add-Member -NotePropertyName ExcludedColumns -NotePropertyValue $(if ($f) { $f.Excluded } else { '' }) -Force
+    $metadataKey = "$($a.PubServer)|$($a.PubDb)".ToUpperInvariant()
+    $known = $false
+    if ($pubDbInfo.ContainsKey($metadataKey)) {
+        $known = @($pubDbInfo[$metadataKey] | Where-Object { $_.publication -eq $a.Publication -and $_.article -eq $a.Article }).Count -gt 0
+    }
+    $a | Add-Member -NotePropertyName FilterMetadataKnown -NotePropertyValue $known -Force
 }
+# Older snapshots have no filter contract: absence means not checked, never unfiltered.
+function Compare-ArticleFilters($Previous, $Current) {
+    if (-not (Get-Prop $Previous 'FilterMetadataKnown') -or -not (Get-Prop $Current 'FilterMetadataKnown')) { return ,@() }
+    $differences = New-Object 'System.Collections.Generic.List[string]'
+    # SQL predicates are compared exactly: case/spacing can matter inside literals.
+    foreach ($field in 'RowFilter', 'ExcludedColumns') {
+        $old = [string](Get-Prop $Previous $field); $new = [string](Get-Prop $Current $field)
+        if ($old -cne $new) { $differences.Add("$field changed: [$old] -> [$new]") }
+    }
+    return ,$differences.ToArray()
+}
+
+function Get-ArticleContractTable($Columns, [string]$Name) {
+    $exact = @($Columns | Where-Object { $_.table_name -ceq $Name })
+    if ($exact.Count) { return @{ Known = $true; Columns = $exact } }
+    if ($Name.Contains('.')) { return @{ Known = $true; Columns = @() } }
+    $matchedColumns = @($Columns | Where-Object { $_.table_basename -ceq $Name })
+    $tables = @($matchedColumns | Select-Object -ExpandProperty table_name -Unique)
+    return @{ Known = ($tables.Count -le 1); Columns = $matchedColumns }
+}
+
+function Compare-ArticleContract($Source, $Destination, $PublishedNames, $SchemaOption) {
+    $differences = New-Object 'System.Collections.Generic.List[object]'
+    $destinationColumns = @{}
+    foreach ($column in $Destination) { $destinationColumns[[string]$column.column_name] = $column }
+    # sp_addarticle @schema_option (learn.microsoft.com/.../sp-addarticle-transact-sql): a bit only
+    # excuses a mismatch it actually documents, and only for the source/destination types and exact
+    # conversion it names - e.g. 0x20 (UDT conversion) does not excuse an ordinary nvarchar being
+    # widened. 0x20000000 and 0x200000000 document a conversion "to types supported on" an older
+    # version without naming the destination type, so they are left out: unverifiable, excuse nothing.
+    # 0x08 is a "replicate X" flag like 0x80/0x1000 (its polarity is inverted from the others below):
+    # set -> timestamp is promised to stay timestamp; NOT set -> it is documented to become binary.
+    # A bit we did not read (schema_option unknown), an unset "replicate X" flag read as absent by
+    # mistake, or a bit/type pairing we do not recognize excuses nothing.
+    $hasSchemaOption = ($null -ne $SchemaOption)
+    $so = if ($hasSchemaOption) { [int64]$SchemaOption } else { [int64]0 }
+    $pkReplicated = $hasSchemaOption -and (($so -band 0x80) -ne 0)
+    $collationReplicated = $hasSchemaOption -and (($so -band 0x1000) -ne 0)
+    foreach ($column in $Source) {
+        if ([string]$column.column_name -cnotin $PublishedNames) { continue }
+        $name = [string]$column.column_name
+        if (-not $destinationColumns.ContainsKey($name)) {
+            $differences.Add([pscustomobject]@{ Column = $name; Field = 'missing'; Source = $name; Destination = ''; Severity = 'warn' })
+            continue
+        }
+        $targetColumn = $destinationColumns[$name]
+        $sourceType = [string]$column.type_name; $targetType = [string]$targetColumn.type_name
+        $typeConversionAllowed = $hasSchemaOption -and (
+            (($so -band 0x08) -eq 0 -and $sourceType -eq 'timestamp' -and $targetType -eq 'binary') -or
+            (($so -band 0x10000000) -ne 0 -and $sourceType -eq 'xml' -and $targetType -eq 'ntext') -or
+            (($so -band 0x2000000000) -ne 0 -and $sourceType -eq 'hierarchyid' -and $targetType -eq 'varbinary') -or
+            (($so -band 0x8000000000) -ne 0 -and $sourceType -in 'geography', 'geometry' -and $targetType -eq 'varbinary')
+        )
+        foreach ($field in 'type_name', 'max_length', 'precision', 'scale', 'nullable', 'pk_ordinal', 'collation_name') {
+            if ([string]$column.$field -cne [string]$targetColumn.$field) {
+                $severity = switch ($field) {
+                    { $_ -in 'type_name', 'max_length', 'precision', 'scale' } { if ($typeConversionAllowed) { 'info' } else { 'warn' } }
+                    'pk_ordinal' { if ($pkReplicated) { 'warn' } else { 'info' } }
+                    'collation_name' { if ($collationReplicated) { 'warn' } else { 'info' } }
+                    default { 'warn' } # nullable: sp_addarticle documents no schema_option bit for it
+                }
+                $differences.Add([pscustomobject]@{ Column = $name; Field = $field; Source = $column.$field; Destination = $targetColumn.$field; Severity = $severity })
+            }
+        }
+    }
+    return ,$differences.ToArray()
+}
+$articleContractRows = New-Object 'System.Collections.Generic.List[object]'
+$schemaByDb = @{}
+function Add-ArticleSchemaResult($it, $r, $secs, $live) {
+    $canonical = $targetCanon[$it.Target]
+    if ($r.Error) { [void]$coverage.Add("Article contracts on ${canonical}: $(Get-ConnHint $r $it.Target)"); return }
+    foreach ($database in $r.SchemaResults) {
+        if ($database.Error) { [void]$coverage.Add("Article contracts in $canonical/$($database.Db): $($database.Error)"); continue }
+        $schemaByDb["$canonical|$($database.Db)".ToUpperInvariant()] = $database
+    }
+}
+if (-not $Monitor) {
+    $schemaNeed = @{}; $schemaTables = @{}
+    foreach ($edge in $edges) {
+        if (-not $edge.SubServer -or $edge.PubType -eq 'Merge') { continue }
+        foreach ($side in @(@($edge.PubServer, $edge.PubDb, $true), @($edge.SubServer, $edge.SubDb, $false))) {
+            $instance = Get-PrimaryInstance $side[0]
+            if (-not $instance -or -not $serverInfo.ContainsKey($instance)) { continue }
+            $target = Get-Target $side[0]
+            if (-not $schemaNeed.ContainsKey($target)) { $schemaNeed[$target] = @{}; $schemaTables[$target] = @{}; $targetCanon[$target] = $side[0] }
+            $database = [string]$side[1]
+            $publisher = [bool]$side[2]
+            if ($schemaNeed[$target].ContainsKey($database)) { $publisher = $publisher -or $schemaNeed[$target][$database] }
+            $schemaNeed[$target][$database] = $publisher
+            if (-not $schemaTables[$target].ContainsKey($database)) {
+                $schemaTables[$target][$database] = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+            }
+            if ($artByPub.ContainsKey($edge.PubKey)) {
+                foreach ($art in $artByPub[$edge.PubKey]) {
+                    $tblName = if ($side[2]) { [string]$art.Source } else { [string]$art.Destination }
+                    if ($tblName) { [void]$schemaTables[$target][$database].Add($tblName) }
+                }
+            }
+        }
+    }
+    if ($schemaNeed.Count) {
+        $schemaTasks = @(foreach ($target in $schemaNeed.Keys) {
+            @{ Key = $target; Target = $target; Task = @{ Kind = 'schema'; Dbs = @(foreach ($database in $schemaNeed[$target].Keys) {
+                $tblList = New-Object 'System.Collections.Generic.List[string]'
+                foreach ($t in $schemaTables[$target][$database]) { $tblList.Add($t) }
+                @{ Db = $database; Publisher = $schemaNeed[$target][$database]; Tables = $tblList.ToArray() }
+            }) } }
+        })
+        Invoke-Collect $schemaTasks 'Add-ArticleSchemaResult' 'Article contracts'
+    }
+    foreach ($edge in $edges) {
+        $sourceKey = "$($edge.PubServer)|$($edge.PubDb)".ToUpperInvariant()
+        $destinationKey = "$($edge.SubServer)|$($edge.SubDb)".ToUpperInvariant()
+        if (-not $edge.SubServer -or -not $schemaByDb.ContainsKey($sourceKey) -or -not $schemaByDb.ContainsKey($destinationKey) -or -not $artByPub.ContainsKey($edge.PubKey)) { continue }
+        foreach ($article in $artByPub[$edge.PubKey]) {
+            $sourceColumns = @($schemaByDb[$sourceKey].Columns | Where-Object { $_.table_name -ceq $article.Source })
+            $destinationTable = Get-ArticleContractTable $schemaByDb[$destinationKey].Columns ([string]$article.Destination)
+            if (-not $destinationTable.Known) { [void]$coverage.Add("Ambiguous destination schema for $($edge.SubDb)/$($article.Destination); column contract not compared."); continue }
+            $destinationColumns = $destinationTable.Columns
+            $publishedRows = @($schemaByDb[$sourceKey].Published | Where-Object { $_.publication -eq $edge.Publication -and $_.article -eq $article.Article })
+            $publishedNames = @($publishedRows | ForEach-Object { [string]$_.column_name })
+            if (-not $sourceColumns.Count -or -not $publishedNames.Count) { [void]$coverage.Add("Article contract not resolved: $($edge.Publication)/$($article.Article)"); continue }
+            $schemaOption = if ($publishedRows.Count) { $publishedRows[0].schema_option } else { $null }
+            foreach ($difference in (Compare-ArticleContract $sourceColumns $destinationColumns $publishedNames $schemaOption)) {
+                $articleContractRows.Add([pscustomobject]@{ Publication = $edge.Publication; Article = $article.Article; Publisher = $edge.PubServer; Subscriber = $edge.SubServer; Column = $difference.Column; Field = $difference.Field; Expected = $difference.Source; Actual = $difference.Destination; Severity = $difference.Severity })
+                Add-Finding $difference.Severity 'Article contract' $edge.SubServer "$($edge.SubDb)/$($article.Destination)" "Published column $($difference.Column): $($difference.Field) [$($difference.Source)] -> [$($difference.Destination)]" 'Review article schema options and intentional subscriber differences before changing schema.'
+            }
+        }
+    }
+}
+
 function Get-PubFilters([string]$PubServer, [string]$PubDb, [string]$Publication) {
     $pre = "$PubServer|$PubDb|$Publication|".ToUpperInvariant()
     return @(foreach ($k in $artFilter.Keys) { if ($k.StartsWith($pre)) { [pscustomobject]@{ Article = $artFilter[$k].Article; Rows = $artFilter[$k].Rows; Excluded = $artFilter[$k].Excluded } } })
@@ -2759,14 +3212,60 @@ foreach ($srv in @($serverInfo.Keys)) {
     }
 }
 
+# Configuration checks only: presence never proves the agent can authenticate.
+function Get-AgReplicaReadiness($Info, [string]$Distributor, $Subscribers) {
+    $checks = New-Object 'System.Collections.Generic.List[object]'
+    if ($null -eq $Info) {
+        $checks.Add([pscustomobject]@{ Check = 'Coverage'; Status = 'unknown'; Detail = 'Replica was not reached; failover prerequisites were not checked.' })
+        return ,$checks.ToArray()
+    }
+    $expected = Get-NormName $Distributor
+    $configured = Get-NormName ([string](Get-Prop $Info 'ConfiguredDistributor'))
+    $status = 'unknown'; $detail = 'Distributor configuration was not read.'
+    if (Get-Prop $Info 'DistributorKnown') {
+        if ($configured -eq $expected) { $status = 'ok'; $detail = 'Expected distributor is configured.' }
+        elseif ($Info.DistributionDbs -and (Get-NormName $Info.Server) -eq $expected) { $status = 'ok'; $detail = 'This replica is the local distributor.' }
+        else { $status = 'missing'; $detail = "Expected distributor $Distributor; configured distributor: $configured" }
+    }
+    $checks.Add([pscustomobject]@{ Check = 'Distributor'; Status = $status; Detail = $detail })
+    $links = @{}
+    foreach ($link in @(Get-Prop $Info 'LinkedServers')) { $links[(Get-NormName ([string]$link.name))] = $true }
+    foreach ($subscriber in $Subscribers) {
+        $status = 'unknown'; $detail = "Linked server $subscriber not visible; metadata visibility is incomplete."
+        if ($links.ContainsKey((Get-NormName ([string]$subscriber)))) {
+            $status = 'ok'; $detail = "Linked server $subscriber exists; agent authentication was not tested."
+        } elseif (Get-Prop $Info 'LinkedServersComplete') {
+            $status = 'missing'; $detail = "Push subscriber $subscriber has no linked server on this replica."
+        }
+        $checks.Add([pscustomobject]@{ Check = 'Linked server'; Status = $status; Detail = $detail })
+    }
+    return ,$checks.ToArray()
+}
+
 # Replication with availability groups: every replica of a published AG database has to be a publisher at the
 # distributor, and the original publisher has to be redirected to the listener - else a failover stops the Log Reader
+$agReadinessRows = New-Object 'System.Collections.Generic.List[object]'
 $agPubDone = @{}
 foreach ($p in $pubs) {
     $orig = Get-NormName ([string]$p.pub_server); $dbU = ([string]$p.pub_db).ToUpperInvariant(); $dist = [string]$p.DistInst
     if (-not $orig -or -not $agByInstDb.ContainsKey("$orig|$dbU") -or $agPubDone.ContainsKey("$dist|$orig|$dbU")) { continue }
     $agPubDone["$dist|$orig|$dbU"] = $true
     $ag = $ags[$agByInstDb["$orig|$dbU"]]; $obj = "$($p.pub_db) (AG $($ag.Name))"
+    $pushSubscribers = @($edges | Where-Object {
+        $_.SubServerRaw -and $_.SubType -notmatch 'Pull' -and
+        (Get-NormName ([string]$_.PubServerRaw)) -eq $orig -and ([string]$_.PubDb).ToUpperInvariant() -eq $dbU
+    } | ForEach-Object { [string]$_.SubServerRaw } | Select-Object -Unique)
+    foreach ($replica in $ag.Replicas.Keys) {
+        $replicaInfo = $null
+        if ($serverInfo.ContainsKey($replica)) { $replicaInfo = $serverInfo[$replica] }
+        foreach ($check in (Get-AgReplicaReadiness $replicaInfo $dist $pushSubscribers)) {
+            $agReadinessRows.Add([pscustomobject]@{ AG = $ag.Name; Database = [string]$p.pub_db; Replica = $replica; Distributor = $dist; Check = $check.Check; Status = $check.Status; Detail = $check.Detail })
+            if ($check.Status -eq 'ok') { continue }
+            $category = 'Coverage'; $severity = 'info'
+            if ($check.Status -eq 'missing') { $category = 'Availability group'; $severity = 'warn' }
+            Add-Finding $severity $category $replica $obj ("Failover readiness ($($check.Check)): $($check.Detail)") 'Review distributor configuration and push-subscriber linked servers on this replica; presence alone does not verify agent credentials.'
+        }
+    }
     if ($serverInfo.ContainsKey($dist) -and $serverInfo[$dist].DistPubsOk) {
         $known = @{}
         foreach ($x in $serverInfo[$dist].DistPubs) { $n = Get-NormName ([string]$x.name); if ($n) { $known[$n] = $true } }
@@ -2987,6 +3486,13 @@ if ($CompareTo) {
     foreach ($a in $articles) {
         $k = "$($a.PubKey)|$($a.Article)".ToUpperInvariant()
         $curArt[$k] = $true
+        if ($prevArt.ContainsKey($k)) {
+            $filterChanges = Compare-ArticleFilters $prevArt[$k] $a
+            if ($filterChanges.Count) {
+                $a.Change = 'changed'
+                $changes.Add([pscustomobject]@{ Change = 'Article filter changed'; Item = "$($a.Publication): $($a.Article)"; Detail = ($filterChanges -join '; ') })
+            }
+        }
         # Articles of a brand new publication are not listed one by one
         if (-not $prevArt.ContainsKey($k) -and $pubsInPrev.ContainsKey($a.PubKey)) {
             $a.Change = 'new'
@@ -3031,6 +3537,7 @@ if (@($edges | Where-Object { $_.Change -ne 'removed' }).Count -eq 0) {
 # ---------------------------------------------------------------------------
 # 9. Graph: servers, nodes and links (shared by HTML, Mermaid and DOT)
 # ---------------------------------------------------------------------------
+function New-ReplGraph($Edges) {
 $gServers = [ordered]@{}   # name -> server object
 $gNodes = [ordered]@{}     # "srv|db" -> node object
 $frameCss = @{ dist = 'fill:#fff4d6,stroke:#c9a227'; failed = 'fill:#fde2e2,stroke:#c0392b,color:#7b1d1d'; unqueried = 'fill:#eeeeee,stroke:#999,stroke-dasharray:4'
@@ -3144,6 +3651,11 @@ if (-not $HideDistributors) {
     }
 }
 
+    return @{ Servers = $gServers; Nodes = $gNodes; Links = $gLinks; Colors = $levelColor; LiveEdges = $liveEdges }
+}
+$initialGraph = New-ReplGraph $edges
+$gServers = $initialGraph.Servers; $gNodes = $initialGraph.Nodes; $gLinks = $initialGraph.Links; $levelColor = $initialGraph.Colors; $liveEdges = $initialGraph.LiveEdges
+
 # Mermaid text from a subset of nodes and links (topology.html builds the same in JavaScript)
 function Build-Mermaid($Nodes, $Links) {
     $out = New-Object System.Collections.Generic.List[string]
@@ -3216,11 +3728,84 @@ $repairMode = 'none'
 if ($AllowAllRepair) { $repairMode = 'all' } elseif ($AllowRepair) { $repairMode = 'safe' }
 
 function New-Problem {
-    return [ordered]@{ Kind = ''; Key = ''; Label = ''; Level = ''; Problem = ''; Status = ''; Job = ''; JobSrv = ''; JobId = ''; JobName = ''
+    return [ordered]@{ Kind = ''; Key = ''; ErrorIdentity = ''; AgentId = ''; ErrorId = 0; ExpectedSeq = ''; IndependentAgent = $null; Label = ''; Level = ''; Problem = ''; Status = ''; Job = ''; JobSrv = ''; JobId = ''; JobName = ''
                        Msg = ''; Codes = (New-Object System.Collections.Generic.List[int]); Text = ''; Seq = ''; Fail = $null
                        PubServer = ''; PubName = ''; PubDb = ''; Publication = ''; PubType = ''; SubServer = ''; SubName = ''; SubDb = ''; SubType = ''
                        DistServer = ''; DistDb = ''; LogWait = ''; Recent = $false; ArtFilter = $null }
 }
+# ---- shared Problem builders: the report (repairs.sql, AI report) and the monitor fill a Problem the same way ----
+# Identity of the subscription, the publication kind and the agent of an edge (needs the script-level $pubs)
+function Set-ProblemSubscription($P, $Edge) {
+    $P.Kind = 'sub'
+    $P.PubServer = [string]$Edge.PubServer; $P.PubName = [string]$Edge.PubServerRaw; $P.PubDb = [string]$Edge.PubDb; $P.Publication = [string]$Edge.Publication; $P.PubType = [string]$Edge.PubType
+    $P.SubServer = [string]$Edge.SubServer; $P.SubName = [string]$Edge.SubServerRaw; $P.SubDb = [string]$Edge.SubDb; $P.SubType = [string]$Edge.SubType
+    $P.DistServer = [string]$Edge.DistributorInstance; $P.DistDb = [string]$Edge.DistributionDb; $P.AgentId = [string]$Edge.AgentId
+    foreach ($publicationInfo in $pubs) {
+        if ($publicationInfo.DistInst -eq $P.DistServer -and (Get-NormName ([string]$publicationInfo.pub_server)) -eq (Get-NormName $P.PubName) -and [string]$publicationInfo.pub_db -eq $P.PubDb -and [string]$publicationInfo.publication -eq $P.Publication) {
+            $P.IndependentAgent = ($publicationInfo.independent_agent -eq 1); break
+        }
+    }
+}
+# Job of the agent: server, id, name and state word (disabled / running / not running) from the job index
+function Set-ProblemJob($P, [string]$JobKey) {
+    if (-not $JobKey) { return }
+    $P.JobSrv = ($JobKey -split '\|')[0]; $P.JobId = ($JobKey -split '\|')[1]
+    if ($jobIdx.ContainsKey($JobKey)) {
+        $j = $jobIdx[$JobKey]; $P.JobName = [string]$j.name
+        if (-not $j.enabled) { $P.Job = 'disabled' } elseif ($j.running) { $P.Job = 'running' } else { $P.Job = 'not running' }
+    }
+}
+# Last error of an agent (the Agents query): code, error id and the failing transaction (xact_seqno) for skip-tx
+function Set-ProblemAgentError($P, $Agent) {
+    if (-not $Agent) { return }
+    $code = 0
+    if ([int]::TryParse([string](Get-Prop $Agent 'error_code'), [ref]$code)) { $P.Codes.Add($code) }
+    $seq = [string](Get-Prop $Agent 'xact_seqno'); $errorId = 0
+    if ($seq -match '^0x(?:[0-9A-Fa-f]{2}){10,16}$' -and [int]::TryParse([string](Get-Prop $Agent 'error_id'), [ref]$errorId) -and $errorId -gt 0) {
+        $P.ErrorId = $errorId; $P.ExpectedSeq = $seq; $P.Seq = $seq.Substring(0, [Math]::Min(22, $seq.Length))
+    }
+}
+# A publication with filtered articles never gets tablediff (it knows no filter); without the failing command the first filtered article stands for it
+function Set-ProblemArtFilter($P) {
+    if ($P.ArtFilter -or $P.Kind -ne 'sub') { return }
+    $filters = @(Get-PubFilters $P.PubServer $P.PubDb $P.Publication)
+    if ($P.Fail -and $P.Fail.article) {
+        foreach ($f in $filters) { if ($f.Article -eq [string]$P.Fail.article) { $P.ArtFilter = $f; return } }
+        return
+    }
+    if ($filters.Count) { $P.ArtFilter = $filters[0] }
+}
+
+# ---- SQL preflights: every executable repair first checks that what the diagnosis saw still holds ----
+function Get-JobPreflightSql([string]$JobId, [string]$Require = 'exists') {
+    $g = [guid]::Parse($JobId).ToString()
+    $sql = "SET NOCOUNT ON;`nIF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysjobs j JOIN msdb.dbo.syscategories c ON c.category_id = j.category_id WHERE j.job_id = '$g' AND c.name LIKE N'REPL-%')`n THROW 51000, 'Job no longer exists or is not a replication agent job; reload diagnosis.', 1;"
+    if ($Require -eq 'disabled') { $sql += "`nIF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE job_id = '$g' AND enabled = 1)`n THROW 51000, 'Job is not disabled any more; reload diagnosis.', 1;" }
+    if ($Require -eq 'idle') {
+        $sql += "`nIF EXISTS (SELECT 1 FROM msdb.dbo.sysjobactivity WHERE job_id = '$g' AND session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions) AND start_execution_date IS NOT NULL AND stop_execution_date IS NULL)`n THROW 51000, 'Job is already running; reload diagnosis.', 1;"
+    }
+    return $sql
+}
+function Get-PublicationPreflightSql($P) {
+    return "SET NOCOUNT ON;`nIF NOT EXISTS (SELECT 1 FROM dbo.syspublications WHERE name = $(Get-SqlLit $P.Publication))`n THROW 51000, 'Publication not found at the publisher; reload diagnosis.', 1;"
+}
+function Get-SubscriptionPreflightSql($P) {
+    $subType = 0; if ($P.SubType -match 'Pull') { $subType = 1 }
+    return @"
+SET NOCOUNT ON;
+DECLARE @srv nvarchar(400) = CASE WHEN OBJECT_ID(N'dbo.MSreplservers') IS NOT NULL
+  THEN N'SELECT srvid AS id, srvname AS name FROM dbo.MSreplservers' ELSE N'SELECT server_id AS id, name FROM sys.servers' END;
+DECLARE @found int = 0, @q nvarchar(max) = N'SELECT @n = COUNT(*) FROM dbo.MSsubscriptions s JOIN dbo.MSpublications p ON p.publication_id = s.publication_id
+  JOIN (' + @srv + N') v ON v.id = s.subscriber_id WHERE p.publication = @pub AND p.publisher_db = @pdb AND s.subscriber_db = @sdb AND v.name = @sub AND s.subscription_type = @st';
+EXEC sys.sp_executesql @q, N'@n int OUTPUT, @pub sysname, @pdb sysname, @sdb sysname, @sub nvarchar(256), @st int', @n = @found OUTPUT,
+  @pub = $(Get-SqlLit $P.Publication), @pdb = $(Get-SqlLit $P.PubDb), @sdb = $(Get-SqlLit $P.SubDb), @sub = $(Get-SqlLit $P.SubName), @st = $subType;
+IF @found = 0 THROW 51000, 'Subscription not found at the distributor; reload diagnosis.', 1;
+"@
+}
+function Get-PullSubscriberPreflightSql($P) {
+    return "SET NOCOUNT ON;`nIF NOT EXISTS (SELECT 1 FROM dbo.MSreplication_subscriptions WHERE publisher = $(Get-SqlLit $P.PubName) AND publisher_db = $(Get-SqlLit $P.PubDb) AND publication = $(Get-SqlLit $P.Publication))`n THROW 51000, 'Pull subscription not found at the subscriber; reload diagnosis.', 1;"
+}
+
 function New-RepairAction([string]$Id, [string]$Title, [string]$Level, [string]$Why, [string]$Risk, [string]$Undo, [string]$Check, [string]$Phrase = '') {
     return [ordered]@{ id = $Id; title = $Title; level = $Level; why = $Why; risk = $Risk; undo = $Undo; check = $Check; confirm = $Phrase
                        steps = (New-Object System.Collections.Generic.List[object]) }
@@ -3234,17 +3819,125 @@ function Get-JobStateWord([string]$Text) {
     return ''
 }
 
+# Push: the agent job lives at the distributor. Pull: it lives at the subscriber (the job is found by the publication in its command line).
+function Test-SkipTransactionCapability($P) {
+    $jobHome = ($P.SubType -eq 'Push' -and $P.JobSrv -eq $P.DistServer) -or ($P.SubType -eq 'Pull' -and $P.JobSrv -and $P.JobSrv -ieq $P.SubServer)
+    $failingStatus = ($P.Status -in 'Failed', 'Retrying') -or ($P.Status -eq 'Not running' -and $P.Problem -match '\bFAILED\b|\bRETRY')
+    return ($P.Kind -eq 'sub' -and $failingStatus -and $P.PubType -eq 'Transactional' -and $P.SubType -in 'Push', 'Pull' -and
+        $P.IndependentAgent -eq $true -and [string]$P.AgentId -match '^\d+$' -and [long]$P.AgentId -gt 0 -and
+        $P.ErrorId -gt 0 -and [string]$P.ExpectedSeq -notmatch '^0x0+$' -and [string]$P.ExpectedSeq -match '^0x(?:[0-9A-Fa-f]{2}){10,16}$' -and
+        $P.JobId -and $jobHome)
+}
+function Get-SkipJobIdleSql($P) {
+    $jobGuid = [guid]::Parse([string]$P.JobId).ToString()
+    return @"
+SET NOCOUNT ON;
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobactivity WHERE job_id = '$jobGuid'
+ AND session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions)
+ AND ((start_execution_date IS NOT NULL AND stop_execution_date IS NULL)
+ OR run_requested_date > COALESCE(stop_execution_date, CONVERT(datetime, '19000101', 112))))
+ THROW 51000, 'Agent is still running or queued; replication position must not be changed.', 1;
+"@
+}
+# A pull job is not named in the distributor's agent row: check at the subscriber that the job is the Distribution Agent of this publication
+function Get-PullJobPreflightSql($P) {
+    $jobGuid = [guid]::Parse([string]$P.JobId).ToString()
+    return @"
+SET NOCOUNT ON;
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysjobs j JOIN msdb.dbo.syscategories c ON c.category_id = j.category_id JOIN msdb.dbo.sysjobsteps st ON st.job_id = j.job_id
+ WHERE j.job_id = '$jobGuid' AND c.name = N'REPL-Distribution' AND CHARINDEX(UPPER($(Get-SqlLit $P.Publication)), UPPER(st.command)) > 0)
+ THROW 51000, 'Pull agent job changed or does not belong to this publication; reload diagnosis.', 1;
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobsteps WHERE job_id = '$jobGuid' AND CHARINDEX('SUBSCRIPTIONSTREAMS', UPPER(command)) > 0)
+ THROW 51000, 'Explicit SubscriptionStreams override requires manual review.', 1;
+"@
+}
+function Get-SkipTransactionPreflight($P, [switch]$Stopped) {
+    if (-not (Test-SkipTransactionCapability $P)) { throw 'Unsupported or incomplete skip transaction diagnosis.' }
+    $jobGuid = [guid]::Parse([string]$P.JobId).ToString()
+    $id = [int]$P.AgentId; $errorId = [int]$P.ErrorId
+    $pub = Get-SqlLit $P.Publication; $publisher = Get-SqlLit $P.PubName; $pubDb = Get-SqlLit $P.PubDb
+    $subscriber = Get-SqlLit $P.SubName; $subDb = Get-SqlLit $P.SubDb
+    $isPull = ($P.SubType -eq 'Pull'); $subType = 0; $jobClause = "AND CONVERT(uniqueidentifier, job_id) = '$jobGuid'"
+    if ($isPull) { $subType = 1; $jobClause = '' }
+    $sql = @"
+SET NOCOUNT ON;
+IF NOT EXISTS (SELECT 1 FROM dbo.MSdistribution_agents
+ WHERE id = $id AND publication = $pub AND publisher_db = $pubDb AND subscriber_db = $subDb
+ AND subscription_type = $subType $jobClause)
+ THROW 51000, 'Agent identity or job changed; reload diagnosis.', 1;
+IF EXISTS (SELECT 1 FROM dbo.MSdistribution_agents WHERE id = $id AND COALESCE(subscriptionstreams, 1) > 1)
+ THROW 51000, 'Multiple subscription streams are not supported by this repair.', 1;
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobsteps WHERE job_id = '$jobGuid' AND CHARINDEX('SUBSCRIPTIONSTREAMS', UPPER(command)) > 0)
+ THROW 51000, 'Explicit SubscriptionStreams override requires manual review.', 1;
+IF EXISTS (SELECT 1 FROM msdb.dbo.MSagent_parameters p JOIN dbo.MSdistribution_agents a ON a.profile_id = p.profile_id
+ WHERE a.id = $id AND p.parameter_name LIKE '%SubscriptionStreams%' AND LTRIM(RTRIM(p.value)) <> '1')
+ THROW 51000, 'SubscriptionStreams profile override requires manual review.', 1;
+DECLARE @errors TABLE (id int, [time] datetime, error_type_id int, source_type_id int, source_name nvarchar(100),
+ error_code nvarchar(256), error_text nvarchar(max), xact_seqno varbinary(16), command_id int, session_id int);
+INSERT @errors EXEC sys.sp_helpsubscriptionerrors @publisher = $publisher, @publisher_db = $pubDb,
+ @publication = $pub, @subscriber = $subscriber, @subscriber_db = $subDb;
+DECLARE @current int, @seq varbinary(16), @error_time datetime;
+SELECT TOP (1) @current = id, @seq = xact_seqno, @error_time = [time] FROM @errors
+ WHERE xact_seqno IS NOT NULL AND xact_seqno <> 0x00 ORDER BY id DESC;
+IF @seq IS NULL OR @seq <> $($P.ExpectedSeq) OR @current NOT IN ($errorId, $($errorId + 1)) OR NOT EXISTS (SELECT 1 FROM dbo.MSrepl_errors WHERE id IN (@current, @current + 1)
+ AND error_code IN ('20598', '2601', '2627') AND [time] BETWEEN @error_time AND DATEADD(second, 2, @error_time))
+ THROW 51000, 'Failing transaction changed or no current data error; reload diagnosis.', 1;
+"@
+    if (-not $Stopped) {
+        $sql += @"
+
+IF COALESCE((SELECT TOP (1) runstatus FROM dbo.MSdistribution_history WHERE agent_id = $id ORDER BY [timestamp] DESC), 0) NOT IN (5, 6)
+ THROW 51000, 'Agent no longer reports a current failure; reload diagnosis.', 1;
+"@
+    }
+    if ($Stopped -and -not $isPull) { $sql += "`n" + (Get-SkipJobIdleSql $P) }   # pull: the job runs at the subscriber, checked there (Get-SkipJobIdleSql)
+    return $sql
+}
+function Get-SkipSubscriberSql($P, [switch]$CheckOnly) {
+    if (-not (Test-SkipTransactionCapability $P)) { throw 'Unsupported or incomplete skip transaction diagnosis.' }
+    $pub = Get-SqlLit $P.Publication; $publisher = Get-SqlLit $P.PubName; $pubDb = Get-SqlLit $P.PubDb
+    $subType = 0; if ($P.SubType -eq 'Pull') { $subType = 1 }
+    $sql = @"
+SET NOCOUNT ON;
+IF COALESCE(IS_SRVROLEMEMBER('sysadmin'), 0) <> 1 AND COALESCE(IS_MEMBER('db_owner'), 0) <> 1
+ THROW 51000, 'Subscriber execution requires sysadmin or db_owner.', 1;
+IF (SELECT COUNT(*) FROM dbo.MSreplication_subscriptions WHERE publisher = $publisher AND publisher_db = $pubDb AND publication = $pub) <> 1
+ THROW 51000, 'Subscriber metadata missing or multiple streams detected.', 1;
+IF NOT EXISTS (SELECT 1 FROM dbo.MSreplication_subscriptions WHERE publisher = $publisher AND publisher_db = $pubDb
+ AND publication = $pub AND independent_agent = 1 AND subscription_type = $subType)
+ THROW 51000, 'Subscriber capability does not match an independent push or pull subscription.', 1;
+IF EXISTS (SELECT 1 FROM dbo.MSreplication_subscriptions WHERE publisher = $publisher AND publisher_db = $pubDb AND publication = $pub AND transaction_timestamp IS NULL)
+ THROW 51000, 'Subscriber position unknown; reload diagnosis.', 1;
+IF EXISTS (SELECT 1 FROM dbo.MSreplication_subscriptions WHERE publisher = $publisher AND publisher_db = $pubDb AND publication = $pub AND transaction_timestamp >= $($P.ExpectedSeq))
+ THROW 51000, 'Subscriber position already advanced; reload diagnosis.', 1;
+"@
+    if (-not $CheckOnly) {
+        $sql += @"
+
+DECLARE @rc int;
+EXEC @rc = sys.sp_setsubscriptionxactseqno @publisher = $publisher, @publisher_db = $pubDb, @publication = $pub, @xact_seqno = $($P.ExpectedSeq);
+IF @rc <> 0 THROW 51000, 'sp_setsubscriptionxactseqno returned failure; check server state.', 1;
+"@
+    }
+    return $sql
+}
+
 function Get-RepairActions($P) {
+    # ids come from SQL Server metadata and are pasted into SQL that runs: accept only their exact shape
+    $g = [guid]::Empty
+    if ($P.JobId -and -not [guid]::TryParse([string]$P.JobId, [ref]$g)) { $P.JobId = '' }
+    if ($P.Seq -and [string]$P.Seq -notmatch '^0x[0-9A-Fa-f]{1,40}$') { $P.Seq = '' }
     $acts = New-Object System.Collections.Generic.List[object]
     $codes = @($P.Codes)
-    $isSub = ($P.Kind -eq 'sub'); $isLr = ($P.Kind -eq 'lr')
+    $isSub = ($P.Kind -eq 'sub' -and $P.PubType -notmatch 'Merge|Peer|P2P'); $isLr = ($P.Kind -eq 'lr')
     $agentWord = 'Distribution Agent'
     if ($isLr) { $agentWord = 'Log Reader Agent' }
+    elseif ($P.PubType -eq 'Merge') { $agentWord = 'Merge Agent' }
     $jobRef = ''; $jobName = $P.JobName
     if ($P.JobId) { $jobRef = "@job_id = N'$($P.JobId)'"; if (-not $jobName) { $jobName = $P.JobId } }
     # stop the job only while it runs: sp_stop_job on a stopped job fails with 22022, and TRY/CATCH does not catch it
     $stopJob = "IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobactivity WHERE job_id = N'$($P.JobId)' AND start_execution_date IS NOT NULL AND stop_execution_date IS NULL`n" +
-               "           AND session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions))`n    EXEC msdb.dbo.sp_stop_job $jobRef;`nWAITFOR DELAY '00:00:05';"
+               "           AND session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions))`n    EXEC msdb.dbo.sp_stop_job $jobRef;`nDECLARE @deadline datetime2 = DATEADD(second, 60, SYSUTCDATETIME());`nWHILE EXISTS (SELECT 1 FROM msdb.dbo.sysjobactivity WHERE job_id = N'$($P.JobId)' AND session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions) AND start_execution_date IS NOT NULL AND stop_execution_date IS NULL)`nBEGIN`n IF SYSUTCDATETIME() >= @deadline BEGIN RAISERROR ('Agent stop timed out; subsequent steps blocked.', 16, 1); RETURN; END;`n WAITFOR DELAY '00:00:01';`nEND;"
     # repairs that follow from error texts only while the agent fails now (old errors of a healthy agent do not count)
     $failing = ($P.Status -in 'Failed', 'Retrying') -or ($P.Level -eq 'error') -or $P.Recent   # Recent: an error in the last 30 min (the agent retries in between)
 
@@ -3253,16 +3946,19 @@ function Get-RepairActions($P) {
         if ($P.Job -eq 'disabled') {
             $a = New-RepairAction 'enable-job' 'Enable and start the agent job' 'safe' "The $agentWord job $jobName is disabled, so the agent does not run." `
                 'None - it only starts the agent.' "EXEC msdb.dbo.sp_update_job $jobRef, @enabled = 0;" 'The agent shows Running within a minute and the pending commands go down.'
+            Add-RepairStep $a $P.JobSrv 'msdb' (Get-JobPreflightSql $P.JobId 'disabled')
             Add-RepairStep $a $P.JobSrv 'msdb' "EXEC msdb.dbo.sp_update_job $jobRef, @enabled = 1;`nEXEC msdb.dbo.sp_start_job $jobRef;"
             $acts.Add($a)
         } elseif ($P.Job -eq 'not running') {
             $a = New-RepairAction 'start-job' 'Start the agent job' 'safe' "The $agentWord job $jobName is not running." 'None.' "EXEC msdb.dbo.sp_stop_job $jobRef;" `
                 'The agent shows Running within a minute. If it fails again, the error in the detail tells why.'
+            Add-RepairStep $a $P.JobSrv 'msdb' (Get-JobPreflightSql $P.JobId 'idle')
             Add-RepairStep $a $P.JobSrv 'msdb' "EXEC msdb.dbo.sp_start_job $jobRef;"
             $acts.Add($a)
         } elseif ($P.Job -eq 'running' -and $P.Status -in 'Failed', 'Retrying') {
             $a = New-RepairAction 'restart-job' 'Restart the agent job' 'safe' "The $agentWord is $($P.Status.ToLowerInvariant()) - a restart helps after network breaks, timeouts and deadlocks." `
                 'None - the agent continues where it stopped.' 'Nothing to undo.' 'The agent shows Running; if the same error comes back, it is not a transient one (see the other repairs).'
+            Add-RepairStep $a $P.JobSrv 'msdb' (Get-JobPreflightSql $P.JobId 'exists')
             Add-RepairStep $a $P.JobSrv 'msdb' "$stopJob`nEXEC msdb.dbo.sp_start_job $jobRef;"
             $acts.Add($a)
         }
@@ -3274,6 +3970,8 @@ function Get-RepairActions($P) {
             $a = New-RepairAction 'snapshot' 'Start the Snapshot Agent' 'safe' 'The subscription waits for an initial snapshot.' `
                 'A snapshot reads every article of the publication on the publisher (load, locks with concurrent snapshot off).' 'Nothing to undo.' `
                 'The Distribution Agent applies the snapshot; the subscription leaves UNINITIALIZED.'
+            if ($P.DistServer -and $P.DistDb) { Add-RepairStep $a $P.DistServer $P.DistDb (Get-SubscriptionPreflightSql $P) }
+            Add-RepairStep $a $P.PubServer $P.PubDb (Get-PublicationPreflightSql $P)
             Add-RepairStep $a $P.PubServer $P.PubDb "EXEC sp_startpublication_snapshot @publication = $pubLit;"
             $acts.Add($a)
         }
@@ -3282,7 +3980,10 @@ function Get-RepairActions($P) {
             $a = New-RepairAction 'reinit' 'Reinitialize the subscription (new snapshot)' 'full' 'The subscription is inactive or expired - the agent cannot continue without a new snapshot.' `
                 'The subscriber tables are reloaded from a new snapshot (load on the publisher and the network; changes made only at the subscriber are lost).' `
                 'No undo - the snapshot replaces the subscriber data.' 'The snapshot is generated and applied; the subscription goes back to Running.' $P.SubDb
+            if ($P.DistServer -and $P.DistDb) { Add-RepairStep $a $P.DistServer $P.DistDb (Get-SubscriptionPreflightSql $P) }
+            Add-RepairStep $a $P.PubServer $P.PubDb (Get-PublicationPreflightSql $P)
             if ($P.SubType -match 'Pull') {
+                Add-RepairStep $a $P.SubServer $P.SubDb (Get-PullSubscriberPreflightSql $P)
                 Add-RepairStep $a $P.SubServer $P.SubDb "EXEC sp_reinitpullsubscription @publisher = $(Get-SqlLit $P.PubName), @publisher_db = $(Get-SqlLit $P.PubDb), @publication = $pubLit;"
                 Add-RepairStep $a $P.PubServer $P.PubDb "EXEC sp_startpublication_snapshot @publication = $pubLit;"
             } else {
@@ -3294,13 +3995,29 @@ function Get-RepairActions($P) {
         # 4. data errors: row missing at the subscriber (20598) or duplicate key (2601, 2627)
         $dataErr = @($codes | Where-Object { $_ -in 20598, 2601, 2627 }).Count -gt 0 -or $P.Text -match '(?i)row was not found at the Subscriber|duplicate key'
         if ($dataErr -and $failing) {
-            if ($P.Seq -and $jobRef) {
-                $a = New-RepairAction 'skip-tx' 'Skip the failing transaction' 'full' 'The agent stops on a data error and retries the same transaction forever.' `
-                    'The whole transaction is not applied at the subscriber - the tables differ afterwards. Compare them (the comparison repair below) and fix the rows.' `
-                    'No undo - apply the skipped changes by hand (the Command button shows them).' 'The agent continues with the next transaction.' 'SKIP'
-                Add-RepairStep $a $P.JobSrv 'msdb' $stopJob
-                Add-RepairStep $a $P.SubServer $P.SubDb ("-- the last applied transaction becomes the failing one, so the agent continues after it`n" +
-                    "EXEC sp_setsubscriptionxactseqno @publisher = $(Get-SqlLit $P.PubName), @publisher_db = $(Get-SqlLit $P.PubDb), @publication = $pubLit, @xact_seqno = $($P.Seq);")
+            if ($P.Seq -and $jobRef -and $P.PubType -eq 'Transactional') {
+                $level = 'script'; $title = 'Skip the failing transaction (manual preflight required)'
+                if (Test-SkipTransactionCapability $P) { $level = 'full'; $title = "Skip the failing transaction (verified independent $($P.SubType.ToLowerInvariant()))" }
+                $a = New-RepairAction 'skip-tx' $title $level 'The agent stops on a data error and retries the same transaction forever.' `
+                    'The whole transaction is omitted. Tables differ afterwards; validate and reconcile them. A failed later step may leave the job stopped.' `
+                    'No automatic undo. Apply skipped changes manually after reviewing the failing command.' 'The agent continues after the verified LSN; compare subscriber data.' 'SKIP'
+                if ($level -eq 'full') {
+                    $publicationSql = "IF NOT EXISTS (SELECT 1 FROM dbo.syspublications WHERE name = $pubLit AND independent_agent = 1 AND (COALESCE(options, 0) & 1) = 0 AND repl_freq = 0) THROW 51000, 'Publication capability changed or is unsupported.', 1;"
+                    Add-RepairStep $a $P.PubServer $P.PubDb $publicationSql
+                    Add-RepairStep $a $P.DistServer $P.DistDb (Get-SkipTransactionPreflight $P)
+                    if ($P.SubType -eq 'Pull') { Add-RepairStep $a $P.JobSrv 'msdb' (Get-PullJobPreflightSql $P) }
+                    Add-RepairStep $a $P.SubServer $P.SubDb (Get-SkipSubscriberSql $P -CheckOnly)
+                    Add-RepairStep $a $P.JobSrv 'msdb' $stopJob
+                    Add-RepairStep $a $P.DistServer $P.DistDb (Get-SkipTransactionPreflight $P -Stopped)
+                    if ($P.SubType -eq 'Pull') { Add-RepairStep $a $P.JobSrv 'msdb' (Get-SkipJobIdleSql $P) }
+                    Add-RepairStep $a $P.SubServer $P.SubDb (Get-SkipSubscriberSql $P)
+                } else {
+                    $skipPublicationLit = $pubLit
+                    if ($P.IndependentAgent -eq $false) { $skipPublicationLit = "N'ALL'" }
+                    Add-RepairStep $a $P.JobSrv 'msdb' $stopJob
+                    Add-RepairStep $a $P.SubServer $P.SubDb ("-- Verify sp_helpsubscriptionerrors after stopping the agent; use a single stream. Shared-agent ALL changes the watermark of every publication serviced by that agent.`n" +
+                        "EXEC sp_setsubscriptionxactseqno @publisher = $(Get-SqlLit $P.PubName), @publisher_db = $(Get-SqlLit $P.PubDb), @publication = $skipPublicationLit, @xact_seqno = $($P.Seq);")
+                }
                 Add-RepairStep $a $P.JobSrv 'msdb' "EXEC msdb.dbo.sp_start_job $jobRef;"
                 $acts.Add($a)
             }
@@ -3319,10 +4036,14 @@ function Get-RepairActions($P) {
                 $a = New-RepairAction 'compare-filtered' "Compare the filtered table $srcOwner.$src by hand (tablediff would compare the whole table)" 'script' `
                     "The article is filtered$(if ($flt.Rows) { " (rows WHERE $($flt.Rows))" })$(if ($flt.Excluded) { " (columns not published: $($flt.Excluded))" }) - tablediff knows no filter, its fix would copy the rows and columns the filter leaves out." `
                     'None - only counts rows.' 'Nothing to undo.' 'Both counts are equal; then compare the keys of the missing rows (the error names the key).'
-                $where = ''
-                if ($flt.Rows) { $where = " WHERE $($flt.Rows)" }
-                Add-RepairStep $a $P.PubServer $P.PubDb "SELECT COUNT_BIG(*) AS rows_at_publisher FROM [$srcOwner].[$src]$where;  -- the rows the filter lets through"
-                Add-RepairStep $a $P.SubServer $P.SubDb "SELECT COUNT_BIG(*) AS rows_at_subscriber FROM [$dstOwner].[$dst];"
+                $iso = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; '
+                $where = ''; $whereNote = '  -- the rows the filter lets through'
+                if ($flt.Rows) {
+                    if (Test-SqlFilterClause ([string]$flt.Rows)) { $where = " WHERE ($($flt.Rows))" }
+                    else { $whereNote = '  -- WARNING: article filter_clause failed validation; add the publication WHERE predicate manually' }
+                }
+                Add-RepairStep $a $P.PubServer $P.PubDb "${iso}SELECT COUNT_BIG(*) AS rows_at_publisher FROM [$($srcOwner.Replace(']', ']]'))].[$($src.Replace(']', ']]'))] WITH (NOLOCK)$where;$whereNote"
+                Add-RepairStep $a $P.SubServer $P.SubDb "${iso}SELECT COUNT_BIG(*) AS rows_at_subscriber FROM [$($dstOwner.Replace(']', ']]'))].[$($dst.Replace(']', ']]'))] WITH (NOLOCK);"
                 $acts.Add($a)
             } else {
             $a = New-RepairAction 'tablediff' "Compare the table $(if ($f -and $f.src) { "$dstOwner.$dst " })and generate the fix (tablediff)" 'script' `
@@ -3355,8 +4076,8 @@ function Get-RepairActions($P) {
     }
     if ($isLr) {
         # 6. the Log Reader cannot find its place in the log (after a restore or a failover with lost log)
-        if ($failing -and $P.Text -match '(?i)sp_repldone|start of replication in the log|log scan number|LSN') {
-            $a = New-RepairAction 'replrestart' 'Resynchronize the Log Reader with the log (sp_replrestart)' 'full' 'The Log Reader points to a log position that the publisher database no longer has (restore, lost log).' `
+        if ($failing -and $P.Text -match '(?i)start of replication in the log|log scan number') {
+            $a = New-RepairAction 'replrestart' 'Resynchronize the Log Reader with the log (sp_replrestart)' 'script' 'The Log Reader points to a log position that the publisher database no longer has (restore, lost log).' `
                 'Transactions between the old and the new position may be missing at the subscribers - validate them afterwards.' 'No undo.' `
                 'The Log Reader runs again; validate the subscriptions (sp_publication_validation).' 'RESTART'
             if ($jobRef) { Add-RepairStep $a $P.JobSrv 'msdb' $stopJob }
@@ -3365,8 +4086,8 @@ function Get-RepairActions($P) {
             $acts.Add($a)
         }
         # 7. the publisher log cannot be truncated (log_reuse_wait = REPLICATION) - last resort
-        if ($P.Level -in 'error', 'warn' -or $P.LogWait -eq 'REPLICATION') {
-            $a = New-RepairAction 'repldone' 'Mark the whole log as replicated (sp_repldone) - last resort when the log is full' 'full' `
+        if ($P.LogWait -eq 'REPLICATION') {
+            $a = New-RepairAction 'repldone' 'Mark the whole log as replicated (sp_repldone) - last resort when the log is full' 'script' `
                 'The publisher log keeps growing because the Log Reader does not read it (log_reuse_wait = REPLICATION).' `
                 'The subscribers never get the changes made until now - every subscription of this database has to be reinitialized afterwards.' `
                 'No undo.' 'The log can be truncated (backup log); reinitialize the subscriptions.' 'REPLDONE'
@@ -3384,6 +4105,7 @@ function Get-RepairActions($P) {
             $acts.Add($a)
         }
     }
+    foreach ($action in $acts) { $action['context'] = $P.ErrorIdentity }
     return , $acts
 }
 
@@ -3394,15 +4116,18 @@ function Get-FindingRepairs($F) {
     $d = $F.Data
     switch ($d.Type) {
         'cleanup-job' {
-            if (-not $d.JobId) { break }
+            $cleanupGuid = [guid]::Empty
+            if (-not $d.JobId -or -not [guid]::TryParse([string]$d.JobId, [ref]$cleanupGuid)) { break }
             $ref = "@job_id = N'$($d.JobId)'"
             if (-not $d.Enabled) {
                 $a = New-RepairAction 'enable-cleanup' 'Enable and start the distribution clean up job' 'safe' 'Without the clean up job the distribution database grows without limit.' `
                     'The first run can take long and load the distributor when much is to be deleted.' "EXEC msdb.dbo.sp_update_job $ref, @enabled = 0;" 'The job runs every 10 minutes and succeeds.'
+                Add-RepairStep $a $d.Srv 'msdb' (Get-JobPreflightSql ([string]$d.JobId) 'disabled')
                 Add-RepairStep $a $d.Srv 'msdb' "EXEC msdb.dbo.sp_update_job $ref, @enabled = 1;`nEXEC msdb.dbo.sp_start_job $ref;"
             } else {
                 $a = New-RepairAction 'start-cleanup' 'Run the distribution clean up job now' 'safe' 'The clean up job failed or has not run recently.' `
                     'The run can take long and load the distributor when much is to be deleted.' 'Nothing to undo.' 'The job succeeds (job history).'
+                Add-RepairStep $a $d.Srv 'msdb' (Get-JobPreflightSql ([string]$d.JobId) 'idle')
                 Add-RepairStep $a $d.Srv 'msdb' "EXEC msdb.dbo.sp_start_job $ref;"
             }
             $acts.Add($a)
@@ -3427,7 +4152,25 @@ function Get-FindingRepairs($F) {
             $a = New-RepairAction 'ag-redirect' 'Redirect the publisher to the AG listener' 'full' 'The agents connect to the original publisher instead of the listener, so a failover stops them.' `
                 'The agents reconnect through the listener (one retry).' 'Redirect to the original server again (sp_redirect_publisher with @redirected_publisher = the old name).' `
                 'sp_validate_redirected_publisher succeeds; the finding disappears.' 'REDIRECT'
-            Add-RepairStep $a $d.Dist $d.DistDb "EXEC sp_redirect_publisher @original_publisher = $(Get-SqlLit $d.Orig), @publisher_db = $(Get-SqlLit $d.Db), @redirected_publisher = $(Get-SqlLit $d.Listener);"
+            $dbLit = Get-SqlLit $d.Db; $origLit = Get-SqlLit $d.Orig; $lnLit = Get-SqlLit $d.Listener
+            Add-RepairStep $a $d.Listener 'master' (@"
+SET NOCOUNT ON;
+IF DB_ID($dbLit) IS NULL THROW 51000, 'Database not found at the AG listener primary; reload diagnosis.', 1;
+IF NOT EXISTS (SELECT 1 FROM sys.availability_databases_cluster adc
+ JOIN sys.dm_hadr_availability_replica_states rs ON rs.group_id = adc.group_id AND rs.is_local = 1 AND rs.role = 1
+ JOIN sys.availability_group_listeners l ON l.group_id = adc.group_id
+ WHERE adc.database_name = $dbLit AND (UPPER(l.dns_name) = UPPER($lnLit) OR UPPER(l.dns_name) LIKE UPPER($lnLit) + N'.%' OR UPPER($lnLit) LIKE UPPER(l.dns_name) + N'.%'))
+ THROW 51000, 'The AG listener does not resolve to the PRIMARY replica for this database; reload diagnosis.', 1;
+"@)
+            Add-RepairStep $a $d.Dist $d.DistDb (@"
+SET NOCOUNT ON;
+IF OBJECT_ID(N'dbo.MSredirected_publishers') IS NULL THROW 51000, 'Distributor does not support publisher redirection.', 1;
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.MSdistpublishers WHERE UPPER(name) = UPPER($origLit))
+ THROW 51000, 'The original publisher is not registered at the distributor; reload diagnosis.', 1;
+IF EXISTS (SELECT 1 FROM dbo.MSredirected_publishers WHERE UPPER(original_publisher) = UPPER($origLit) AND UPPER(publisher_db) = UPPER($dbLit) AND UPPER(redirected_publisher) = UPPER($lnLit))
+ THROW 51000, 'Publisher database is already redirected to this listener; reload diagnosis.', 1;
+"@)
+            Add-RepairStep $a $d.Dist $d.DistDb "EXEC sp_redirect_publisher @original_publisher = $origLit, @publisher_db = $dbLit, @redirected_publisher = $lnLit;"
             $acts.Add($a)
         }
     }
@@ -3451,7 +4194,7 @@ function Format-RepairScript([string]$Label, $A) {
         $o.Add("-- Step $i of $($A.steps.Count): $where")
         if (-not $s.db) { foreach ($ln in ($s.sql -split "`n")) { $o.Add("-- $ln") }; continue }
         $o.Add(":CONNECT $(Get-Target $s.srv)")
-        $o.Add("USE [$($s.db)];")
+        $o.Add("USE [$(([string]$s.db).Replace(']', ']]'))];")
         $o.Add($s.sql)
         $o.Add('GO')
     }
@@ -3459,17 +4202,34 @@ function Format-RepairScript([string]$Label, $A) {
 }
 
 # ---- reports for an AI assistant: names and data values masked unless -NoMask ----
-function New-AiMasker { return @{ Names = @{}; Map = (New-Object System.Collections.Generic.List[string]); Count = @{} } }
+function New-AiMasker { return @{ Names = @{}; Originals = @{}; TokenOwners = @{}; Map = (New-Object System.Collections.Generic.List[string]); Count = @{} } }
+function New-AiNameToken($M, [string]$Kind) {
+    if (-not $M.Count.ContainsKey($Kind)) { $M.Count[$Kind] = 0 }
+    do { $M.Count[$Kind]++; $token = "$Kind$($M.Count[$Kind])" }
+    while ($M.Originals.ContainsKey($token) -or $M.TokenOwners.ContainsKey($token))
+    return $token
+}
 function Add-AiName($M, [string]$Name, [string]$Kind) {
     if (-not $Name) { return }
     $Name = $Name.Trim()
-    if ($Name.Length -lt 3 -or $Name -match '^(?i)(dbo|sys|master|msdb|tempdb|model|distribution|all|null|sql|agent)$') { return }
+    if (($Kind -eq 'SCH' -and $Name -match '^(?i)(dbo|sys)$') -or
+        ($Kind -eq 'DB' -and $Name -match '^(?i)(master|msdb|tempdb|model|distribution)$')) { return }
     $k = $Name.ToUpperInvariant()
     if ($M.Names.ContainsKey($k)) { return }
-    if (-not $M.Count.ContainsKey($Kind)) { $M.Count[$Kind] = 0 }
-    $M.Count[$Kind]++
-    $tok = "$Kind$($M.Count[$Kind])"
-    $M.Names[$k] = $tok; $M.Map.Add("$tok = $Name")
+    $M.Originals[$k] = $Name
+    # An actual identifier can itself be named DB1/SRV1. Keep tokens disjoint
+    # from all registered identifiers, including ones registered later.
+    if ($M.TokenOwners.ContainsKey($Name)) {
+        $existing = $M.TokenOwners[$Name]
+        $oldToken = $M.Names[$existing]
+        $newToken = New-AiNameToken $M ($oldToken -replace '\d+$', '')
+        $index = $M.Map.IndexOf("$oldToken = $($M.Originals[$existing])")
+        $M.Names[$existing] = $newToken
+        [void]$M.TokenOwners.Remove($oldToken); $M.TokenOwners[$newToken] = $existing
+        if ($index -ge 0) { $M.Map[$index] = "$newToken = $($M.Originals[$existing])" }
+    }
+    $tok = New-AiNameToken $M $Kind
+    $M.Names[$k] = $tok; $M.TokenOwners[$tok] = $k; $M.Map.Add("$tok = $Name")
 }
 function Add-AiServer($M, [string]$Name) {
     if (-not $Name) { return }
@@ -3489,13 +4249,41 @@ function Protect-AiText($M, [string]$Text) {
     if ($NoMask) { return $Text }
     # replication procedures carry the owner and the table in their name (sp_MSupd_dboOrders)
     $Text = [regex]::Replace($Text, '(?i)\bsp_MS(ins|upd|del)_[A-Za-z0-9_]+', 'sp_MS$1_<article>')
-    foreach ($k in @($M.Names.Keys | Sort-Object Length -Descending)) {
+    if ($M.Names.Count) {
         # '_' counts as a border: snapshot files (Orders_3.sch) and folders (SRV_DB_PUB) join names with it
-        $Text = [regex]::Replace($Text, '(?<![A-Za-z0-9])' + [regex]::Escape($k) + '(?![A-Za-z0-9])', $M.Names[$k], 'IgnoreCase')
+        # One pass prevents a replacement token from being replaced as another name.
+        $namesRx = (@($M.Names.Keys | Sort-Object Length -Descending | ForEach-Object { [regex]::Escape($_) }) -join '|')
+        $Text = [regex]::Replace($Text, '(?<![A-Za-z0-9])(?:' + $namesRx + ')(?![A-Za-z0-9])', [System.Text.RegularExpressions.MatchEvaluator] { param($match) $M.Names[$match.Value.ToUpperInvariant()] }, 'IgnoreCase')
     }
     $Text = [regex]::Replace($Text, '(?i)(key value is \()[^)]*(\))', '$1<masked>$2')
     $Text = [regex]::Replace($Text, '\b(?:\d{1,3}\.){3}\d{1,3}\b', '<ip>')
-    return [regex]::Replace($Text, '(?i)\b(?:[a-z0-9-]+\.)+(?:com|net|org|local|lan|corp|intra|int|pl|de|fr|eu|uk|biz|info)\b', '<domain>')
+    $Text = [regex]::Replace($Text, '(?i)\b(?:[a-z0-9-]+\.)+(?:com|net|org|local|lan|corp|intra|internal|int|pl|de|fr|eu|uk|biz|info)\b', '<domain>')
+    # what the known-name list cannot know: UNC paths, quoted values (data in error texts), DOMAIN\account, IPv6
+    $tokRx = '^(?:SRV|HOST|INST|DB|PUB|TAB|COL|SCH|JOB|AG)\d+$'
+    $Text = [regex]::Replace($Text, '\\\\[\w.-]+(?:\\[\w$.-]+)*', '<path>')
+    $Text = [regex]::Replace($Text, "'(?:[^']|'')*'", [System.Text.RegularExpressions.MatchEvaluator] { param($m) if ($m.Value.Trim("'") -match $tokRx) { $m.Value } else { "'<value>'" } })
+    $Text = [regex]::Replace($Text, '(?<![\w\\])([\w-]+)\\[\w.$-]+', [System.Text.RegularExpressions.MatchEvaluator] { param($m) if ($m.Groups[1].Value -match $tokRx) { $m.Value } else { '<account>' } })
+    return [regex]::Replace($Text, '(?i)(?<![\w:])(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?![\w:])', [System.Text.RegularExpressions.MatchEvaluator] { param($m) if ($m.Value.Contains('::') -or ($m.Value.Split(':').Count - 1) -ge 5) { '<ip>' } else { $m.Value } })
+}
+# Structured fields use exact lookup; punctuation in an identifier does not
+# determine whether the field is protected. Register all fields before rendering.
+function Protect-AiNameField($M, [string]$Value) {
+    if ($NoMask -or -not $Value) { return $Value }
+    $key = $Value.Trim().ToUpperInvariant()
+    if ($M.Names.ContainsKey($key)) { return [string]$M.Names[$key] }
+    return Protect-AiText $M $Value
+}
+function Test-AiMaskedText($M, [string]$Text) {
+    $remaining = 0
+    if (-not $NoMask) {
+        # Assigned tokens are safe by construction: none is an original name.
+        $tokens = (@($M.Names.Values | ForEach-Object { [regex]::Escape($_) }) -join '|')
+        if ($tokens) { $Text = [regex]::Replace($Text, '(?<![A-Za-z0-9])(?:' + $tokens + ')(?![A-Za-z0-9])', ' ', 'IgnoreCase') }
+        foreach ($name in $M.Names.Keys) {
+            if ([regex]::IsMatch($Text, '(?<![A-Za-z0-9])' + [regex]::Escape($name) + '(?![A-Za-z0-9])', 'IgnoreCase')) { $remaining++ }
+        }
+    }
+    return [pscustomobject]@{ ok = ($remaining -eq 0); masked = (-not $NoMask); checkedNames = $M.Names.Count; remaining = $remaining; scope = 'known-identifiers' }
 }
 # Names the masker knows: servers, listeners, AGs, databases, publications, tables
 function Add-AiKnownNames($M) {
@@ -3507,6 +4295,10 @@ function Add-AiKnownNames($M) {
         Add-AiName $M ([string]$e.PubDb) 'DB'; Add-AiName $M ([string]$e.SubDb) 'DB'; Add-AiName $M ([string]$e.DistributionDb) 'DB'; Add-AiName $M ([string]$e.Publication) 'PUB'
     }
     foreach ($a in $articles) {
+        foreach ($qualified in @($a.Source, $a.Destination)) { Add-AiName $M ([string]$qualified) 'TAB' }
+        foreach ($qualified in @($a.Source, $a.Destination)) {
+            if ([string]$qualified -match '^(.+)\.[^.]+$') { Add-AiName $M ($Matches[1] -replace '[\[\]]', '') 'SCH' }
+        }
         foreach ($n in @($a.Article, $a.Source, $a.Destination)) { $t = ([string]$n -replace '^.*\.', '') -replace '[\[\]]', ''; Add-AiName $M $t 'TAB' }
     }
     # columns left out by a column filter (names like PESEL or SALARY say more than they should)
@@ -3516,26 +4308,77 @@ function Add-AiKnownNames($M) {
         foreach ($db in @($si.Dbs.Values)) { Add-AiName $M ([string]$db.name) 'DB' }
         foreach ($j in $si.Jobs) { if ([string]$j.category -like 'REPL-*') { Add-AiName $M ([string]$j.name) 'JOB' } }
     }
+    # Contract metadata can reveal schemas/columns absent from filters.
+    foreach ($schema in $schemaByDb.Values) {
+        foreach ($column in $schema.Columns) {
+            Add-AiName $M ([string]$column.column_name) 'COL'
+            Add-AiName $M ([string]$column.table_name) 'TAB'
+        }
+    }
 }
 $aiQuestion = @(
     'I run SQL Server replication (transactional, with availability groups where noted). Below is what a monitoring tool',
     'collected. Names are replaced by tokens (SRV1, DB1, PUB1, TAB1 ...) and data values by their type.',
     'Please find the most likely root cause, then give the fix step by step with T-SQL, and mark the steps that change',
     'data or need a new snapshot. Say what else I should check and with which queries.')
+function Protect-AiMapFile([string]$Path) {
+    try {
+        if ([System.Environment]::OSVersion.Platform -in ([System.PlatformID]::Unix), ([System.PlatformID]::MacOSX)) {
+            $err = & chmod 600 $Path 2>&1
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Could not restrict permissions on ${Path}: $err" }
+        } else {
+            $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $err = & icacls.exe $Path /inheritance:r /grant:r "${user}:(R,W)" 2>&1
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Could not restrict permissions on ${Path}: $err" }
+        }
+    } catch {
+        Write-Warning "Could not restrict permissions on ${Path}: $($_.Exception.Message)"
+    }
+}
 # Writes the report (masked unless -NoMask) and the token list; returns the paths
-function Save-AiReport([string]$Raw, $M, [string]$BaseName) {
+function Save-AiReport([string]$Raw, $M, [string]$BaseName, [switch]$Preview, [switch]$Prepared) {
+    $text = $Raw
+    if (-not $Prepared) { $text = Protect-AiText $M $Raw }
+    $validation = Test-AiMaskedText $M $text
+    if (-not $validation.ok) { throw "AI report rejected: $($validation.remaining) known identifiers remain after masking." }
+    if ($Preview) { return [pscustomobject]@{ File = ''; Map = ''; Text = $text; Validation = $validation; Masker = $M; BaseName = $BaseName } }
     if (-not (Test-Path -LiteralPath $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
-    $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+    $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
     $file = Join-Path $OutputDir "$BaseName-$stamp.md"
-    $text = Protect-AiText $M $Raw
-    [System.IO.File]::WriteAllText($file, $text, (New-Object System.Text.UTF8Encoding $false))
     $mapFile = ''
     if (-not $NoMask) {
         $mapFile = Join-Path $OutputDir "$BaseName-$stamp.names.txt"
         $hdr = @('# Tokens of ' + (Split-Path $file -Leaf) + ' - keep this file here, do not paste it into the AI chat.', '')
-        [System.IO.File]::WriteAllText($mapFile, (($hdr + @($M.Map)) -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
+        Write-AtomicText $mapFile (($hdr + @($M.Map)) -join "`r`n")
+        Protect-AiMapFile $mapFile
     }
-    return [pscustomobject]@{ File = $file; Map = $mapFile; Text = $text }
+    try { Write-AtomicText $file $text }
+    catch {
+        if ($mapFile -and [IO.File]::Exists($mapFile)) { [IO.File]::Delete($mapFile) }
+        throw
+    }
+    return [pscustomobject]@{ File = $file; Map = $mapFile; Text = $text; Validation = $validation }
+}
+function Register-MonAiPreview($Report) {
+    if (-not $mon.ContainsKey('AiPreviews')) { $mon.AiPreviews = @{} }
+    $now = Get-Date
+    foreach ($id in @($mon.AiPreviews.Keys)) { if (($now - $mon.AiPreviews[$id].At).TotalMinutes -ge 10) { [void]$mon.AiPreviews.Remove($id) } }
+    if ($mon.AiPreviews.Count -ge 8) {
+        $oldest = $mon.AiPreviews.Keys | Sort-Object { $mon.AiPreviews[$_].At } | Select-Object -First 1
+        [void]$mon.AiPreviews.Remove($oldest)
+    }
+    $id = [guid]::NewGuid().ToString('N')
+    $mon.AiPreviews[$id] = @{ At = $now; Report = $Report }
+    return $id
+}
+function Save-MonAiPreview([string]$Id) {
+    if (-not $mon.ContainsKey('AiPreviews') -or -not $mon.AiPreviews.ContainsKey($Id)) { throw 'Preview is unavailable. Open the preview again.' }
+    $entry = $mon.AiPreviews[$Id]
+    if (((Get-Date) - $entry.At).TotalMinutes -ge 10) { [void]$mon.AiPreviews.Remove($Id); throw 'Preview expired. Open the preview again.' }
+    $report = $entry.Report
+    $saved = Save-AiReport $report.Text $report.Masker $report.BaseName -Prepared
+    [void]$mon.AiPreviews.Remove($Id)
+    return $saved
 }
 
 # ---------------------------------------------------------------------------
@@ -3571,7 +4414,7 @@ function Get-Secs($From, $To) {
 }
 function Format-Dt($d) { if ($d -is [datetime]) { return $d.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) } return '' }
 function New-MonList { return , (New-Object System.Collections.Generic.List[object]) }
-# Built-in JSON (100x faster than ConvertTo-JsonText for the live state); -Html escapes < > & for a <script> block
+# Built-in JSON (faster than ConvertTo-JsonText for the live state; dates and 1.0 differ, so reports keep ConvertTo-JsonText); -Html escapes < > & for a <script> block
 function ConvertTo-FastJson($Obj, [switch]$Html) {
     $p = @{ InputObject = $Obj; Depth = 12; Compress = $true }
     if ($Html -and $PSVersionTable.PSVersion.Major -ge 6) { $p.EscapeHandling = 'EscapeHtml' }   # Windows PowerShell 5.1 escapes < > & by itself
@@ -3585,12 +4428,102 @@ function Add-MonEvent([string]$Level, [string]$Text, [string]$Key = '') {
     $col = @{ error = 'Red'; warn = 'Yellow'; ok = 'Green'; info = 'Gray' }[$Level]
     Write-Host ("[{0}] {1}" -f (Get-Date).ToString('HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), $Text) -ForegroundColor $col
 }
+# Metric-only history. File I/O runs outside the monitor loop; no SQL or messages are persisted.
+function Initialize-MonHistory([string]$Directory, [int]$Days, [int]$MaxMB) {
+    $mon.HistoryConfig = @{ Directory = $Directory; Days = $Days; Bytes = $MaxMB * 1MB }
+    $mon.HistoryQueue = New-Object 'System.Collections.Generic.List[string]'
+    $mon.HistoryWriter = $null; $mon.HistoryFault = ''; $mon.HistoryReplay = $true
+    try {
+        foreach ($name in 'monitor-history.previous.jsonl', 'monitor-history.jsonl') {
+            $path = Join-Path $Directory $name
+            if (-not [IO.File]::Exists($path)) { continue }
+            if ((Get-Item -LiteralPath $path).Length -gt $mon.HistoryConfig.Bytes) { throw 'History exceeds configured size; move it aside before replay.' }
+            foreach ($line in [IO.File]::ReadLines($path)) {
+                try {
+                    $sample = $line | ConvertFrom-Json
+                    if ($sample.schema -ne 1 -or $sample.metric -notin 'lat', 'rt', 'pd') { continue }
+                    if ([datetime]::Parse($sample.at).ToUniversalTime() -lt [datetime]::UtcNow.AddDays(-$Days)) { continue }
+                    if (-not $mon.SubByKey.ContainsKey($sample.key) -and -not $mon.LrByKey.ContainsKey($sample.key)) { continue }
+                    Add-MonHist ([string]$sample.key) ([string]$sample.metric) $sample.value
+                } catch { Write-Verbose "Skipped malformed history line: $($_.Exception.Message)" }
+            }
+        }
+    } catch { $mon.HistoryFault = $_.Exception.Message; Add-MonEvent 'warn' ("History replay unavailable: " + $mon.HistoryFault) }
+    finally { $mon.HistoryReplay = $false }
+}
+function Add-MonHistorySample([string]$Key, [string]$Metric, $Value) {
+    if (-not $mon.ContainsKey('HistoryConfig') -or $mon.HistoryReplay) { return }
+    if ($mon.HistoryQueue.Count -ge 256) {
+        if ($mon.HistoryFault -ne 'queue full') { $mon.HistoryFault = 'queue full'; Add-MonEvent 'warn' 'History queue full; dropping new samples until the writer catches up.' }
+        return
+    }
+    $mon.HistoryQueue.Add((ConvertTo-JsonText ([ordered]@{ schema = 1; at = [datetime]::UtcNow.ToString('o'); key = $Key; metric = $Metric; value = $Value })))
+}
+function Step-MonHistory {
+    if (-not $mon.ContainsKey('HistoryConfig')) { return }
+    if ($mon.HistoryWriter) {
+        $writer = $mon.HistoryWriter
+        if (-not $writer.Handle.IsCompleted) { return }
+        try {
+            [void]$writer.PS.EndInvoke($writer.Handle)
+            if ($writer.PS.HadErrors) { throw ($writer.PS.Streams.Error | Out-String) }
+            if ($mon.HistoryFault) { Add-MonEvent 'ok' 'History writer recovered'; $mon.HistoryFault = '' }
+        } catch {
+            $message = $_.Exception.Message
+            if ($mon.HistoryFault -ne $message) { Add-MonEvent 'warn' "History writer failed (batch lost): $message"; $mon.HistoryFault = $message }
+        } finally { $writer.PS.Dispose(); $mon.HistoryWriter = $null }
+    }
+    if (-not $mon.HistoryQueue.Count) { return }
+    $batch = $mon.HistoryQueue.ToArray(); $mon.HistoryQueue.Clear()
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript({
+        param($Directory, $MaxBytes, $Days, $Lines)
+        $ErrorActionPreference = 'Stop'
+        [void][IO.Directory]::CreateDirectory($Directory)
+        $current = Join-Path $Directory 'monitor-history.jsonl'
+        $previous = Join-Path $Directory 'monitor-history.previous.jsonl'
+        foreach ($path in @($current, $previous)) {
+            if ([IO.File]::Exists($path) -and [IO.File]::GetLastWriteTimeUtc($path) -lt [datetime]::UtcNow.AddDays(-$Days)) { [IO.File]::Delete($path) }
+        }
+        foreach ($line in $Lines) {
+            $bytes = [Text.Encoding]::UTF8.GetByteCount($line + "`n")
+            if ($bytes -gt $MaxBytes) { continue }
+            if ([IO.File]::Exists($current) -and (Get-Item -LiteralPath $current).Length + $bytes -gt $MaxBytes) {
+                if ([IO.File]::Exists($previous)) { [IO.File]::Delete($previous) }
+                [IO.File]::Move($current, $previous)
+            }
+            [IO.File]::AppendAllText($current, $line + "`n", (New-Object Text.UTF8Encoding $false))
+        }
+    }).AddArgument($mon.HistoryConfig.Directory).AddArgument($mon.HistoryConfig.Bytes).AddArgument($mon.HistoryConfig.Days).AddArgument($batch)
+    $mon.HistoryWriter = @{ PS = $ps; Handle = $ps.BeginInvoke() }
+}
+
+function Update-MonBacklogTrend([string]$Key, $Value) {
+    if ($mon.ContainsKey('HistoryReplay') -and $mon.HistoryReplay) { return }
+    if (-not $mon.ContainsKey('BacklogTrend')) { $mon.BacklogTrend = @{} }
+    if (-not $mon.BacklogTrend.ContainsKey($Key)) { $mon.BacklogTrend[$Key] = @{ Previous = $null; Rises = 0; Active = $false } }
+    $trend = $mon.BacklogTrend[$Key]
+    if ($null -eq $Value) { $trend.Previous = $null; $trend.Rises = 0; return }
+    if ($null -ne $trend.Previous -and $Value -gt $trend.Previous) { $trend.Rises++ }
+    else { $trend.Rises = 0 }
+    if ($trend.Rises -ge 3 -and -not $trend.Active) {
+        $trend.Active = $true
+        Add-MonEvent 'warn' 'Backlog has grown for three successive measurements.' $Key
+    } elseif ($trend.Active -and $null -ne $trend.Previous -and $Value -lt $trend.Previous) {
+        $trend.Active = $false
+        Add-MonEvent 'ok' 'Backlog is decreasing again.' $Key
+    }
+    $trend.Previous = $Value
+}
+
 function Add-MonHist([string]$Key, [string]$Name, $Value) {
     if (-not $mon.Hist.ContainsKey($Key)) { $mon.Hist[$Key] = @{} }
     $h = $mon.Hist[$Key]
     if (-not $h.ContainsKey($Name)) { $h[$Name] = New-MonList }
     $h[$Name].Add($Value)
     if ($h[$Name].Count -gt 60) { $h[$Name].RemoveAt(0) }
+    Add-MonHistorySample $Key $Name $Value
+    if ($Name -eq 'pd') { Update-MonBacklogTrend $Key $Value }
 }
 function Get-MonHist([string]$Key, [string]$Name) {
     if ($mon.Hist.ContainsKey($Key) -and $mon.Hist[$Key].ContainsKey($Name)) { return , $mon.Hist[$Key][$Name].ToArray() }
@@ -3598,13 +4531,13 @@ function Get-MonHist([string]$Key, [string]$Name) {
 }
 
 # Static model: subscriptions, Log Readers, servers to query and how agent sessions are recognised
-function New-MonModel {
+function New-MonModel([hashtable]$LogReaders = $logReaderIdx) {
     $mon.Subs = New-MonList; $mon.Lrs = New-MonList; $mon.SubByKey = @{}; $mon.LrByKey = @{}
-    $mon.AgentKey = @{}; $mon.AgentByName = @{}; $mon.ByName = @{}; $mon.Targets = [ordered]@{}
-    $mon.Raw = @{}; $mon.Pending = @{}; $mon.Hist = @{}; $mon.Prev = @{}; $mon.Rate = @{}; $mon.ErrLast = @{}
+    $mon.AgentKey = @{}; $mon.AgentByName = (New-ReplAgentIndexes $agents).Names; $mon.ByName = @{}; $mon.Targets = [ordered]@{}
+    $mon.Raw = @{}; $mon.Pending = @{}; $mon.PendingStatus = @{}; $mon.Hist = @{}; $mon.Prev = @{}; $mon.Rate = @{}; $mon.ErrLast = @{}
     $mon.WaitPrev = @{}; $mon.Waits = @{}; $mon.SessPrev = @{}; $mon.AgentWaits = @{}; $mon.Events = New-MonList; $mon.Errors = New-MonList
     $mon.Deferred = New-MonList; $mon.Seq = 0; $mon.JsonSeq = -1; $mon.Json = ''; $mon.Paused = $false; $mon.Interval = $RefreshSeconds
-    $mon.Stop = $false; $mon.Ui = 'web'; $mon.Url = ''; $mon.LastFault = ''; $mon.LastDetail = @{}; $mon.Repair = $null; $mon.Skipped = @{}; $mon.Out = @{ Subs = @(); Lrs = @(); Blocking = @(); Sessions = @(); Ag = @() }; $mon.LastLine = ''; $mon.LastLineAt = [datetime]::MinValue
+    $mon.Stop = $false; $mon.Remote = $false; $mon.Ui = 'web'; $mon.Url = ''; $mon.LastFault = ''; $mon.LastDetail = @{}; $mon.DetailIdentity = @{}; $mon.Repair = $null; $mon.Skipped = @{}; $mon.Out = @{ Subs = @(); Lrs = @(); Blocking = @(); Sessions = @(); Ag = @() }; $mon.LastLine = ''; $mon.LastLineAt = [datetime]::MinValue
     $typeNum = @{ Transactional = 0; P2P = 0; Snapshot = 1; Merge = 2 }
     $sqlNames = New-Object 'System.Collections.Generic.HashSet[string]'
 
@@ -3613,10 +4546,9 @@ function New-MonModel {
         $lbl = "$($a.kind) agent $($a.name)"
         if ($a.kind -eq 'S') { $lbl = "Snapshot Agent $($a.publisher)/$($a.publisher_db) $($a.publication)" }
         $mon.AgentKey[$k] = @{ k = ''; lbl = $lbl }
-        if ($a.name) { $mon.AgentByName["$($a.DistInst)|$(([string]$a.name).ToUpperInvariant())"] = $k }
     }
-    foreach ($k in @($logReaderIdx.Keys | Sort-Object)) {
-        $lr = $logReaderIdx[$k]
+    foreach ($k in @($LogReaders.Keys | Sort-Object)) {
+        $lr = $LogReaders[$k]
         $pub = Get-Canon (Resolve-Name (Get-NormName ([string]$lr.publisher))) ([string]$lr.publisher_db)
         $jobKey = ''; $cont = $false
         if ($lr.job_id) {
@@ -3636,22 +4568,24 @@ function New-MonModel {
     foreach ($e in @($edges | Where-Object { $_.SubServer -and $_.Change -ne 'removed' } | Sort-Object PubServer, PubDb, Publication, SubServer, SubDb)) {
         $lrKey = ''
         if ($e.PubType -eq 'Transactional' -or $e.PubType -eq 'P2P') {
-            $lk = "$($e.DistributorInstance)|$(Get-NormName $e.PubServerRaw)|$($e.PubDb.ToUpperInvariant())"
+            $lk = "$($e.DistributorInstance)|$($e.DistributionDb)|$(Get-NormName $e.PubServerRaw)|$($e.PubDb.ToUpperInvariant())"
             if ($mon.LrByKey.ContainsKey($lk)) { $lrKey = $lk }
         }
+        $agentKind = 'D'
+        if ($e.PubType -eq 'Merge') { $agentKind = 'M' }
         $agentName = ''
-        if ($agentIdx.ContainsKey("$($e.DistributorInstance)|D|$($e.AgentId)")) { $agentName = [string]$agentIdx["$($e.DistributorInstance)|D|$($e.AgentId)"].name }
+        if ($agentIdx.ContainsKey("$($e.DistributorInstance)|$($e.DistributionDb)|$agentKind|$($e.AgentId)")) { $agentName = [string]$agentIdx["$($e.DistributorInstance)|$($e.DistributionDb)|$agentKind|$($e.AgentId)"].name }
         $o = [pscustomobject]@{
             Key = $e.Key; Edge = $e; LrKey = $lrKey; DistInst = $e.DistributorInstance; DistDb = $e.DistributionDb
             DbKey = "$($e.DistributorInstance)|$($e.DistributionDb.ToUpperInvariant())"
             HKey = ("$($e.PubServerRaw)|$($e.PubDb)|$($e.Publication)|$($e.SubServerRaw)|$($e.SubDb)").ToUpperInvariant()
-            AgentId = [string]$e.AgentId; AgentName = $agentName; JobKey = [string]$e.JobKey; JobContinuous = [bool]$e.JobContinuous
+            AgentKind = $agentKind; AgentId = [string]$e.AgentId; AgentName = $agentName; JobKey = [string]$e.JobKey; JobContinuous = [bool]$e.JobContinuous
             SubName = "$($e.PubServerRaw)_$($e.PubDb)_$($e.Publication)"; SubInsts = @(Get-Instances $e.SubServer)
             Label = "$($e.Publication): $($e.PubServer)/$($e.PubDb) -> $($e.SubServer)/$($e.SubDb)"
             Notes = (@(([string]$e.Problem) -split ', ' | Where-Object { $_ -and $_ -notmatch $transientRx }) -join ', ')
         }
         $mon.Subs.Add($o); $mon.SubByKey[$o.Key] = $o
-        if ($o.AgentId) { $mon.AgentKey["$($o.DbKey)|D|$($o.AgentId)"] = @{ k = $o.Key; lbl = $o.Label } }
+        if ($o.AgentId) { $mon.AgentKey["$($o.DbKey)|$($o.AgentKind)|$($o.AgentId)"] = @{ k = $o.Key; lbl = $o.Label } }
         foreach ($pair in @(@($agentName, 'distributor', ''), @($o.SubName, 'subscriber', $e.SubDb.ToUpperInvariant()))) {
             if (-not $pair[0]) { continue }
             [void]$sqlNames.Add($pair[0])
@@ -3752,6 +4686,502 @@ function Get-SessionAgent([string]$Srv, $Sess) {
     return $null
 }
 
+# Refresh known distributors in the request pool. Never expand the authorized target set.
+function Initialize-MonListeners {
+    $mon.ListenerChecks = [ordered]@{}
+    foreach ($listener in $listenerInst.Keys) {
+        # Only listeners actually reached during initial discovery are authorized.
+        $mon.ListenerChecks[$listener] = @{ Target = (Get-Target $listener); Next = [datetime]::MinValue; Fault = '' }
+    }
+}
+function Apply-MonListenerResult([string]$Listener, $Result) {
+    $probe = $mon.ListenerChecks[$Listener]
+    if ($mon.Repair) { return }
+    if ($Result.Error) {
+        if ($probe.Fault -ne $Result.Error) { $probe.Fault = $Result.Error; Add-MonEvent 'warn' "Listener $Listener probe failed: $($Result.Error)" }
+        return
+    }
+    $real = Resolve-Name (Get-NormName ([string]$Result.SrvName))
+    $previous = $listenerInst[$Listener]
+    if ($real -eq $previous) { $probe.Fault = ''; return }
+    $ag = $ags[$agByListener[$Listener]]
+    if (-not $real -or -not $ag.Replicas.Contains($real)) {
+        $fault = "Listener $Listener points to unrecognized replica $real; migration refused."
+        if ($probe.Fault -ne $fault) { $probe.Fault = $fault; Add-MonEvent 'error' $fault }
+        return
+    }
+    $primaryConfirmed = @($Result.AgRows | Where-Object {
+        ([string]$_.ag_name).ToUpperInvariant() -eq ([string]$ag.Name).ToUpperInvariant() -and
+        (Get-NormName ([string]$_.replica_server_name)) -eq $real -and $_.role_desc -eq 'PRIMARY'
+    }).Count -gt 0
+    if (-not $primaryConfirmed) {
+        $fault = "Listener $Listener reached $real but its PRIMARY role was not confirmed; migration postponed."
+        if ($probe.Fault -ne $fault) { $probe.Fault = $fault; Add-MonEvent 'warn' $fault }
+        return
+    }
+    $oldTarget = $null
+    if ($mon.Targets.Contains($previous)) { $oldTarget = $mon.Targets[$previous] }
+    elseif ($mon.Targets.Contains($real)) { $oldTarget = $mon.Targets[$real] }
+    if ($null -eq $oldTarget) { return }
+    if ($oldTarget.Name -eq $previous -and $oldTarget.Target -eq $probe.Target -and $oldTarget.Dist.Count) {
+        Add-MonEvent 'warn' "Listener $Listener also carries distributor monitoring; target migration requires rediscovery."
+        return
+    }
+    $probe.Fault = ''
+    $listenerInst[$Listener] = $real; $ag.Primary = $real
+    foreach ($replica in @($ag.Replicas.Keys)) { $ag.Replicas[$replica] = $(if ($replica -eq $real) { 'PRIMARY' } else { 'SECONDARY' }) }
+    if (-not $mon.Targets.Contains($real)) {
+        $target = $oldTarget.Clone()
+        $target.Name = $real; $target.Target = $probe.Target; $target.Dist = [ordered]@{}
+        $target.PS = $null; $target.Handle = $null; $target.StopHandle = $null; $target.TimedOut = $false; $target.Retire = $false
+        $target.Next = Get-Date; $target.Started = $null; $target.Cycle = 0; $target.Ok = $null; $target.Err = ''; $target.At = ''; $target.Took = $null
+        $target.Sessions = [bool]$Result.ViewServerState; $target.Ag = ([bool]$Result.Hadr -and $target.Sessions); $target.Jobs = $false
+        $target.Notes = @(); $target.PendingFresh = $false; $target.PendingNow = $false
+        $mon.Targets[$real] = $target
+        if ($serverInfo.ContainsKey($previous)) {
+            $info = $serverInfo[$previous].PSObject.Copy()
+            $info.Server = $real; $info.ConnectedAs = $probe.Target; $info.Version = $Result.Version; $info.Edition = $Result.Edition
+            $info.Login = $Result.Login; $info.Sysadmin = $Result.Sysadmin; $info.ViewServerState = $Result.ViewServerState; $info.Hadr = $Result.Hadr
+            $info.Dbs = @{}; $info.Jobs = @(); $info.DistributionDbs = ''; $info.AgRole = 'PRIMARY'
+            $serverInfo[$real] = $info
+        }
+    }
+    # A physical target keeps monitoring the old replica. A listener-backed target
+    # retires only when its current invocation finishes, preserving its handle.
+    if ($oldTarget.Name -eq $previous -and $oldTarget.Target -eq $probe.Target) { $oldTarget.Retire = $true }
+    $mon.Targets[$real].Retire = $false
+    foreach ($subscription in $mon.Subs) {
+        if ($subscription.Edge.PubServer -eq $Listener) { $subscription.Edge.PubInstance = $real }
+        if ($subscription.Edge.SubServer -eq $Listener) { $subscription.Edge.SubInstance = $real }
+    }
+    $graph = New-ReplGraph @($mon.Subs | ForEach-Object { $_.Edge })
+    $script:gServers = $graph.Servers; $script:gNodes = $graph.Nodes; $script:gLinks = $graph.Links
+    $mon.TopologyVersion++; $mon.Seq++
+    if ($mon.Ui -eq 'web') { $mon.Page = Get-MonPage }
+    Add-MonEvent 'warn' "Listener $Listener primary changed: $previous -> $real; subscription histories preserved."
+}
+function Step-MonListeners {
+    foreach ($name in @($mon.Targets.Keys)) {
+        $target = $mon.Targets[$name]
+        if ($target.ContainsKey('Retire') -and $target.Retire -and -not $target.PS) {
+            $mon.Targets.Remove($name); [void]$mon.Raw.Remove($name); [void]$mon.Waits.Remove($name); [void]$mon.WaitPrev.Remove($name)
+            [void]$serverInfo.Remove($name)
+        }
+    }
+    if ($mon.Repair -or $mon.Paused -or $mon.Deferred.Count -ge 4 -or @($mon.Deferred | Where-Object { $_.Kind -in 'listener', 'topology', 'discovery' }).Count) { return }
+    foreach ($listener in $mon.ListenerChecks.Keys) {
+        $probe = $mon.ListenerChecks[$listener]
+        if ((Get-Date) -lt $probe.Next) { continue }
+        $probe.Next = (Get-Date).AddSeconds([Math]::Max(10, $mon.Interval))
+        Start-MonQuery $null $probe.Target @{ Kind = 'test' } 'listener' $listener
+        return
+    }
+}
+
+function Initialize-MonDiscovery {
+    $mon.DiscoveryQueue = New-Object 'System.Collections.Generic.Queue[object]'
+    $mon.DiscoverySeen = @{}; $mon.DiscoveryCount = $mon.Targets.Count + $failed.Count; $mon.DiscoveryLimitReported = $false
+}
+function Add-MonDiscoveryCandidate([string]$Name, [string]$Database = '') {
+    if ($NoCrawl -or -not $Name) { return }
+    $normalized = Resolve-Name (Get-NormName $Name)
+    if (-not $normalized -or $normalized -like '*_ID=*') { return }
+    if ($Database) { $normalized = Get-Canon $normalized $Database }
+    if ($mon.Targets.Contains($normalized) -or ($mon.ContainsKey('ListenerChecks') -and $mon.ListenerChecks.Contains($normalized))) { return }
+    $target = Get-Target $normalized
+    if (-not $connectFor.ContainsKey($normalized) -and -not $connectName.ContainsKey($normalized)) { $target = $Name.Trim() }
+    $key = "$normalized|$target".ToUpperInvariant()
+    if ($mon.DiscoverySeen.ContainsKey($key)) { return }
+    if ($mon.DiscoveryCount -ge $MaxServers) {
+        if (-not $mon.DiscoveryLimitReported) { $mon.DiscoveryLimitReported = $true; Add-MonEvent 'warn' "Topology discovery reached MaxServers=$MaxServers; new targets skipped." }
+        return
+    }
+    $mon.DiscoverySeen[$key] = $true; $mon.DiscoveryCount++
+    $mon.DiscoveryQueue.Enqueue(@{ Name = $normalized; Target = $target })
+    if ($SqlCredential -and -not ($Encrypt -eq 'Strict' -or ($StrictCert -and $Encrypt -eq 'Mandatory')) -and -not $warnedCrawl) {
+        $script:warnedCrawl = $true
+        Add-MonEvent 'warn' 'The SQL login is reused for targets discovered from metadata without validated TLS. NoCrawl restricts discovery; Mandatory with StrictCert validates transport.'
+    }
+}
+function Add-MonDiscoveryReferences($Result) {
+    if ($NoCrawl) { return }
+    Add-AgInfo $Result
+    Add-MonDiscoveryCandidate ([string]$Result.RemoteDistributor)
+    foreach ($edge in $Result.Edges) {
+        Add-MonDiscoveryCandidate ([string]$edge.PubServerRaw) ([string]$edge.PubDb)
+        Add-MonDiscoveryCandidate ([string]$edge.SubServerRaw) ([string]$edge.SubDb)
+    }
+    foreach ($redirectRow in $Result.Redirected) { Add-MonDiscoveryCandidate ([string]$redirectRow.Listener) }
+    foreach ($replica in $Result.AgRows) {
+        Add-MonDiscoveryCandidate ([string]$replica.replica_server_name)
+        if ($replica.dns_name) { Add-MonDiscoveryCandidate ([string]$replica.dns_name) }
+    }
+}
+function Set-MonServerMetadata([string]$Instance, [string]$Target, $Result) {
+    $databases = @{}
+    foreach ($database in $Result.Dbs) { $databases[([string]$database.name).ToUpperInvariant()] = $database }
+    $serverInfo[$Instance] = [pscustomobject]@{
+        Server = $Instance; ConnectedAs = $Target; Version = $Result.Version; Edition = $Result.Edition; Login = $Result.Login
+        Sysadmin = $Result.Sysadmin; ViewServerState = $Result.ViewServerState; Hadr = $Result.Hadr; Port = $Result.Port; Transport = $Result.Transport
+        AgentService = $Result.AgentService; DistributionDbs = ($Result.DistDbs -join ', '); RemoteDistributor = $Result.RemoteDistributor
+        AgRole = ''; Aliases = ''; Publications = 0; Error = ($Result.DbErrors -join ' '); Support = ''; UpgradeLimit = ''
+        Dbs = $databases; Jobs = $Result.Jobs; Profiles = $Result.Profiles; Retention = $Result.Retention; DistHealth = $Result.DistHealth
+        DistPubs = $Result.DistPubs; DistPubsOk = $Result.DistPubsOk; DistributorKnown = $Result.DistributorKnown
+        ConfiguredDistributor = $Result.RemoteDistributor; LinkedServers = $Result.LinkedServers; LinkedServersComplete = $Result.LinkedServersComplete
+    }
+    # forget the pull jobs and profiles of this instance first: a job that was deleted must not stay in the indexes
+    $instancePrefix = "$Instance|".ToUpperInvariant()
+    foreach ($staleKey in @($script:pullJobIdx.Keys | Where-Object { $_.StartsWith($instancePrefix) })) { $script:pullJobIdx.Remove($staleKey) }
+    foreach ($staleKey in @($script:profileIdx.Keys | Where-Object { $_.StartsWith("$Instance|") })) { $script:profileIdx.Remove($staleKey) }
+    foreach ($job in $Result.Jobs) { Add-JobMetadata $Instance $job }
+    Add-ProfileMetadata $Instance $Result.Profiles
+    if ($mon.Targets.Contains($Instance)) {
+        $mon.Targets[$Instance].Sessions = [bool]$Result.ViewServerState
+        $mon.Targets[$Instance].Ag = ([bool]$Result.Hadr -and [bool]$Result.ViewServerState)
+        $mon.Targets[$Instance].Jobs = ($Result.Jobs.Count -gt 0)
+    }
+}
+function Publish-MonGraphCatalog {
+    $graph = New-ReplGraph @($mon.Subs | ForEach-Object { $_.Edge })
+    $script:gServers = $graph.Servers; $script:gNodes = $graph.Nodes; $script:gLinks = $graph.Links
+    $mon.TopologyVersion++; $mon.Seq++
+    if ($mon.Ui -eq 'web') { $mon.Page = Get-MonPage }
+}
+function Apply-MonDiscoveryResult($Request, $Result) {
+    if ($NoCrawl) { return }
+    if ($mon.Repair) { throw 'Discovery cannot publish metadata during a repair.' }
+    if ($Result.Error) { Add-MonEvent 'warn' "Discovery of $($Request.Name) failed: $($Result.Error)"; return }
+    $real = Resolve-Name (Get-NormName ([string]$Result.SrvName))
+    if (-not $real) { Add-MonEvent 'warn' "Discovery returned no server identity for $($Request.Name)."; return }
+    Add-AgInfo $Result
+    $listener = Remove-Port (Get-NormName ([string]$Request.Target))
+    if ($agByListener.ContainsKey($listener) -and @($Result.AgRows | Where-Object { (Get-NormName ([string]$_.replica_server_name)) -eq $real -and $_.role_desc -eq 'PRIMARY' }).Count) {
+        $listenerInst[$listener] = $real
+        if (-not $mon.ListenerChecks.Contains($listener)) { $mon.ListenerChecks[$listener] = @{ Target = $Request.Target; Next = [datetime]::MinValue; Fault = '' } }
+    } elseif (-not $agByListener.ContainsKey($listener) -and $Request.Name -ne $real) { $aliasMap[$Request.Name] = $real }
+    if (-not $connectFor.ContainsKey($real)) { $connectFor[$real] = $Request.Target }
+    $isNew = -not $mon.Targets.Contains($real)
+    if ($isNew) {
+        $mon.Targets[$real] = @{ Name = $real; Target = $Request.Target; Dist = [ordered]@{}; Sessions = $false; Ag = $false; Jobs = $false
+            PS = $null; Handle = $null; Next = [datetime]::MinValue; Started = $null; Cycle = 0; Took = $null; Ok = $null; Err = ''
+            At = ''; Notes = @(); PendingNow = $false; PendingFresh = $false }
+    }
+    Set-MonServerMetadata $real ([string]$Request.Target) $Result
+    foreach ($database in $Result.DistDbs) {
+        if (-not $mon.Targets[$real].Dist.Contains($database)) { $mon.Targets[$real].Dist[$database] = New-Object 'System.Collections.Generic.HashSet[string]' }
+    }
+    if ($isNew) { Add-MonEvent 'info' "Discovered server $real via $($Request.Target)." }
+    Apply-MonTopologyResult $real $Result
+    Publish-MonGraphCatalog
+}
+function Step-MonDiscovery {
+    if ($NoCrawl -or $mon.Repair -or $mon.Paused -or -not $mon.DiscoveryQueue.Count -or $mon.Deferred.Count -ge 4) { return }
+    # One background crawl at a time is within both the discovery throttle and request budget.
+    if (@($mon.Deferred | Where-Object { $_.Kind -in 'topology', 'listener', 'discovery' }).Count) { return }
+    $request = $mon.DiscoveryQueue.Dequeue()
+    Start-MonQuery $null $request.Target @{ Kind = 'server' } 'discovery' $request
+}
+
+function Remove-MonRetiredState([string]$Key) {
+    foreach ($cache in 'Hist', 'Prev', 'Rate', 'Skipped', 'BacklogTrend', 'AgentWaits', 'LastDetail', 'DetailIdentity') {
+        if ($mon.ContainsKey($cache)) { [void]$mon[$cache].Remove($Key) }
+    }
+}
+
+function Start-MonTopologyRefresh {
+    if ($mon.Repair) { return 'Topology refresh is blocked while a repair is running.' }
+    if ($mon.TopologyQueue.Count -or $mon.ContractQueue.Count -or ($mon.ContainsKey('DiscoveryQueue') -and $mon.DiscoveryQueue.Count) -or @($mon.Deferred | Where-Object { $_.Kind -in 'topology', 'listener', 'discovery', 'contract' }).Count) { return 'Topology refresh already running.' }
+    foreach ($target in $mon.Targets.Values) {
+        if (-not ($target.ContainsKey('Retire') -and $target.Retire)) { $mon.TopologyQueue.Enqueue($target.Name); $mon.ContractQueue.Enqueue($target.Name) }
+    }
+    $mon.TopologyNext = (Get-Date).AddSeconds([Math]::Max(1, $TopologyEverySeconds))
+    return $null
+}
+# Sides (publisher/subscriber database) of the current, non-Merge subscriptions whose primary
+# instance is $Instance - shared by the contract db-need (enqueue) and canonical resolution (apply).
+function Get-MonContractSides([string]$Instance) {
+    $sides = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($subscription in $mon.Subs) {
+        $edge = $subscription.Edge
+        if (-not $edge.SubServer -or $edge.PubType -eq 'Merge') { continue }
+        foreach ($pair in @(@($edge.PubServer, $edge.PubDb, $true), @($edge.SubServer, $edge.SubDb, $false))) {
+            if ((Get-PrimaryInstance $pair[0]) -ne $Instance) { continue }
+            $sides.Add(@{ Canonical = [string]$pair[0]; Db = [string]$pair[1]; Publisher = [bool]$pair[2]; PubKey = [string]$edge.PubKey })
+        }
+    }
+    return ,$sides
+}
+function Get-MonContractDbNeed([string]$Instance) {
+    $need = @{}; $tablesByDb = @{}
+    foreach ($side in (Get-MonContractSides $Instance)) {
+        $pub = $side.Publisher
+        if ($need.ContainsKey($side.Db)) { $pub = $pub -or $need[$side.Db] }
+        $need[$side.Db] = $pub
+        if (-not $tablesByDb.ContainsKey($side.Db)) {
+            $tablesByDb[$side.Db] = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        }
+        if ($side.PubKey -and $artByPub.ContainsKey($side.PubKey)) {
+            foreach ($art in $artByPub[$side.PubKey]) {
+                $tblName = if ($side.Publisher) { [string]$art.Source } else { [string]$art.Destination }
+                if ($tblName) { [void]$tablesByDb[$side.Db].Add($tblName) }
+            }
+        }
+    }
+    return ,@(foreach ($db in $need.Keys) {
+        $tbls = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($t in $tablesByDb[$db]) { $tbls.Add($t) }
+        @{ Db = $db; Publisher = $need[$db]; Tables = $tbls.ToArray() }
+    })
+}
+# Article contracts in the monitor: schema for the known publisher/subscriber databases of each
+# target, read on the same R1 topology-refresh cadence (Start-MonTopologyRefresh), not a new timer.
+function Apply-MonArticleContractResult([string]$Instance, $Result) {
+    # Read-only: does not rebuild indexes or touch repair-sensitive state, so unlike topology it is
+    # never blocked by/blocking of a repair - it just reconciles whatever schemaByDb ends up holding.
+    $sides = Get-MonContractSides $Instance
+    $failKeys = @{}
+    if ($Result.Error) {
+        # A whole-target failure (connection lost, deadline) must drop every db this instance answers
+        # for - keeping old entries would make the next unrelated instance's refresh rebuild rows from
+        # stale data and stamp them as current (the same A07 class a per-db error already avoids below).
+        foreach ($side in $sides) {
+            $key = "$($side.Canonical)|$($side.Db)".ToUpperInvariant()
+            $schemaByDb.Remove($key)
+            $failKeys[$key] = "$($side.Canonical)/$($side.Db): $($Result.Error)"
+        }
+    } else {
+        $byDb = @{}
+        foreach ($database in $Result.SchemaResults) { $byDb[[string]$database.Db] = $database }
+        foreach ($side in $sides) {
+            if (-not $byDb.ContainsKey($side.Db)) { continue }
+            $database = $byDb[$side.Db]
+            $key = "$($side.Canonical)|$($side.Db)".ToUpperInvariant()
+            if ($database.Error) { $schemaByDb.Remove($key); $failKeys[$key] = "$($side.Canonical)/$($side.Db): $($database.Error)"; continue }
+            $schemaByDb[$key] = $database
+        }
+    }
+    # $mon.ContractFailKeys tracks every instance's failures, but this call only knows this
+    # instance's sides - touch only those keys, or another instance's still-failing side would
+    # look "recovered" here and its own next call would then wrongly re-report it as new.
+    foreach ($k in $failKeys.Keys) { if (-not $mon.ContractFailKeys.ContainsKey($k)) { Add-MonEvent 'warn' "Article contracts in $($failKeys[$k])" }; $mon.ContractFailKeys[$k] = $failKeys[$k] }
+    foreach ($side in $sides) {
+        $key = "$($side.Canonical)|$($side.Db)".ToUpperInvariant()
+        if (-not $failKeys.ContainsKey($key) -and $mon.ContractFailKeys.ContainsKey($key)) { Add-MonEvent 'info' "Article contracts readable again in $key"; $mon.ContractFailKeys.Remove($key) }
+    }
+    # Rebuild the whole list from current subscriptions each time - cheap at this scale, and avoids
+    # stale rows for subscriptions a topology refresh already removed (the A07 class: stale beats missing).
+    $subscribedEdgeKeys = @{}
+    $comparedKeys = @{}
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($subscription in $mon.Subs) {
+        $edge = $subscription.Edge
+        if (-not $edge.SubServer -or $edge.PubType -eq 'Merge' -or -not $artByPub.ContainsKey($edge.PubKey)) { continue }
+        $subscribedEdgeKeys["$($edge.Publication)|$($edge.PubServer)|$($edge.SubServer)"] = $true
+        $sourceKey = "$($edge.PubServer)|$($edge.PubDb)".ToUpperInvariant()
+        $destinationKey = "$($edge.SubServer)|$($edge.SubDb)".ToUpperInvariant()
+        if (-not $schemaByDb.ContainsKey($sourceKey) -or -not $schemaByDb.ContainsKey($destinationKey)) { continue }
+        foreach ($article in $artByPub[$edge.PubKey]) {
+            $sourceColumns = @($schemaByDb[$sourceKey].Columns | Where-Object { $_.table_name -ceq $article.Source })
+            $destinationTable = Get-ArticleContractTable $schemaByDb[$destinationKey].Columns ([string]$article.Destination)
+            if (-not $destinationTable.Known) { continue }
+            $destinationColumns = $destinationTable.Columns
+            $publishedRows = @($schemaByDb[$sourceKey].Published | Where-Object { $_.publication -eq $edge.Publication -and $_.article -eq $article.Article })
+            $publishedNames = @($publishedRows | ForEach-Object { [string]$_.column_name })
+            if (-not $sourceColumns.Count -or -not $publishedNames.Count) { continue }
+            # Actually compared (both schemas present, destination resolved, published columns known) -
+            # distinct from "no longer a warning", which a missed read must not be allowed to claim.
+            $comparedKeys["$($edge.Publication)|$($article.Article)|$($edge.PubServer)|$($edge.SubServer)"] = $true
+            $schemaOption = if ($publishedRows.Count) { $publishedRows[0].schema_option } else { $null }
+            foreach ($difference in (Compare-ArticleContract $sourceColumns $destinationColumns $publishedNames $schemaOption)) {
+                $rows.Add([pscustomobject]@{ Publication = $edge.Publication; Article = $article.Article; Publisher = $edge.PubServer; Subscriber = $edge.SubServer; Column = $difference.Column; Field = $difference.Field; Expected = $difference.Source; Actual = $difference.Destination; Severity = $difference.Severity })
+            }
+        }
+    }
+    $warnKeys = @{}
+    foreach ($row in $rows) {
+        if ($row.Severity -ne 'warn') { continue }
+        $label = "$($row.Publication)/$($row.Article) $($row.Publisher)->$($row.Subscriber) column $($row.Column) ($($row.Field))"
+        $warnKeys["$($row.Publication)|$($row.Article)|$($row.Publisher)|$($row.Subscriber)|$($row.Column)|$($row.Field)"] = $label
+    }
+    foreach ($k in $warnKeys.Keys) { if (-not $mon.ContractWarnKeys.ContainsKey($k)) { Add-MonEvent 'warn' "Article contract mismatch: $($warnKeys[$k])" } }
+    foreach ($k in $mon.ContractWarnKeys.Keys) {
+        if ($warnKeys.ContainsKey($k)) { continue }
+        $f = $k -split '\|'
+        if ($comparedKeys.ContainsKey("$($f[0])|$($f[1])|$($f[2])|$($f[3])")) {
+            # Genuinely re-checked and no longer mismatched.
+            Add-MonEvent 'info' "Article contract mismatch resolved: $($mon.ContractWarnKeys[$k])"
+        } elseif ($subscribedEdgeKeys.ContainsKey("$($f[0])|$($f[2])|$($f[3])")) {
+            # Still subscribed but not re-checked this round (schema unreadable) - no measurement is
+            # not "resolved" (A07): keep the warning open, raise no event either way.
+            $warnKeys[$k] = $mon.ContractWarnKeys[$k]
+        }
+        # else: the subscription itself is gone; topology already reported its removal.
+    }
+    $mon.ContractWarnKeys = $warnKeys
+    $script:articleContractRows = $rows
+    $mon.ContractAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+    $mon.Seq++
+}
+# Articles of a topology refresh: replace the articles of the distribution databases that were read (and returned rows), keep the rest
+function Update-MonArticles([string]$Instance, $Result, $ReadDatabases) {
+    $withRows = @{}
+    foreach ($raw in $Result.Articles) { $withRows[([string]$raw.DistDb).ToUpperInvariant()] = $true }
+    $replaced = @($ReadDatabases | Where-Object { $withRows.ContainsKey($_) })
+    if (-not $replaced.Count) { return }
+    $previous = @{}
+    foreach ($article in $script:articles) { $previous["$($article.PubKey)|$($article.Article)".ToUpperInvariant()] = $article }
+    $updated = New-MonList; $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($article in $script:articles) {
+        if ($article.DistInst -eq $Instance -and ([string]$article.DistDb).ToUpperInvariant() -in $replaced) { continue }
+        [void]$seen.Add("$($article.PubKey)|$($article.Article)".ToUpperInvariant()); $updated.Add($article)
+    }
+    foreach ($raw in $Result.Articles) {
+        if (([string]$raw.DistDb).ToUpperInvariant() -notin $replaced) { continue }
+        $pubServer = Get-Canon (Resolve-Name (Get-NormName $raw.PubServerRaw)) $raw.PubDb
+        $pubKey = ("$pubServer|$($raw.PubDb)|$($raw.Publication)").ToUpperInvariant()
+        $identity = "$pubKey|$($raw.Article)".ToUpperInvariant()
+        if (-not $seen.Add($identity)) { continue }
+        $obj = [pscustomobject]@{ PubKey = $pubKey; PubServer = $pubServer; PubDb = $raw.PubDb; Publication = $raw.Publication; Article = $raw.Article
+                                  Source = $raw.Source; Destination = $raw.Destination; Change = ''; DistInst = $Instance; DistDb = [string]$raw.DistDb
+                                  RowFilter = ''; ExcludedColumns = ''; FilterMetadataKnown = $false }
+        if ($previous.ContainsKey($identity)) {
+            $old = $previous[$identity]
+            foreach ($field in 'RowFilter', 'ExcludedColumns', 'FilterMetadataKnown') { $obj.$field = Get-Prop $old $field }
+        }
+        $updated.Add($obj)
+    }
+    $script:articles = $updated.ToArray()
+    $byPub = @{}
+    foreach ($article in $script:articles) {
+        if (-not $byPub.ContainsKey($article.PubKey)) { $byPub[$article.PubKey] = New-Object System.Collections.Generic.List[object] }
+        $byPub[$article.PubKey].Add($article)
+    }
+    $script:artByPub = $byPub
+}
+function Apply-MonTopologyResult([string]$Instance, $Result) {
+    if ($mon.Repair) { throw 'Cannot reconcile topology during a repair.' }
+    if ($Result.Error) { Add-MonEvent 'warn' "Topology read failed on $Instance : $($Result.Error)"; return }
+    if ((Resolve-Name (Get-NormName ([string]$Result.SrvName))) -ne $Instance) {
+        Add-MonEvent 'warn' "Topology target $Instance changed identity; reconciliation postponed."
+        return
+    }
+    Set-MonServerMetadata $Instance ([string]$mon.Targets[$Instance].Target) $Result
+    Add-MonDiscoveryReferences $Result
+    $readDatabases = @($Result.DistOk | ForEach-Object { ([string]$_).ToUpperInvariant() })
+    if (-not $readDatabases.Count) { return }
+    $updatedPublications = New-MonList
+    foreach ($publicationInfo in $pubs) {
+        if ($publicationInfo.DistInst -ne $Instance -or ([string]$publicationInfo.DistDb).ToUpperInvariant() -notin $readDatabases) { $updatedPublications.Add($publicationInfo) }
+    }
+    foreach ($publicationInfo in $Result.Pubs) {
+        if (([string]$publicationInfo.DistDb).ToUpperInvariant() -notin $readDatabases) { continue }
+        $publicationInfo | Add-Member -NotePropertyName DistInst -NotePropertyValue $Instance -Force
+        $updatedPublications.Add($publicationInfo)
+    }
+    $script:pubs = $updatedPublications
+    $edges = New-MonList
+    foreach ($subscription in $mon.Subs) {
+        if ($subscription.DistInst -ne $Instance -or $subscription.DistDb.ToUpperInvariant() -notin $readDatabases) { $edges.Add($subscription.Edge) }
+    }
+    foreach ($edge in $Result.Edges) {
+        if ($edge.DistributionDb.ToUpperInvariant() -notin $readDatabases) { continue }
+        $publisherInstance = Resolve-Name (Get-NormName $edge.PubServerRaw)
+        $subscriberInstance = Resolve-Name (Get-NormName $edge.SubServerRaw)
+        $publisher = Get-Canon $publisherInstance $edge.PubDb
+        $subscriber = ''
+        if ($subscriberInstance) { $subscriber = Get-Canon $subscriberInstance $edge.SubDb }
+        foreach ($pair in @(@('PubInstance', $publisherInstance), @('SubInstance', $subscriberInstance), @('DistributorInstance', $Instance), @('PubServer', $publisher), @('SubServer', $subscriber),
+            @('Key', "$publisher|$($edge.PubDb)|$($edge.Publication)|$subscriber|$($edge.SubDb)".ToUpperInvariant()), @('PubKey', "$publisher|$($edge.PubDb)|$($edge.Publication)".ToUpperInvariant()))) {
+            $edge | Add-Member -NotePropertyName $pair[0] -NotePropertyValue $pair[1] -Force
+        }
+        $edge.Distributor = Get-Canon $Instance $edge.DistributionDb
+        foreach ($field in 'ArticleNames', 'Change', 'ChangeText', 'Job', 'JobKey', 'SkipErrors', 'RowDiff') { $edge | Add-Member -NotePropertyName $field -NotePropertyValue '' -Force }
+        $edge | Add-Member -NotePropertyName JobContinuous -NotePropertyValue $false -Force
+        foreach ($field in 'Tables', 'Fails', 'Retries') { $edge | Add-Member -NotePropertyName $field -NotePropertyValue $null -Force }
+        $edges.Add($edge)
+    }
+    $agents = New-MonList
+    foreach ($agent in $mon.TopologyAgents) {
+        if ($agent.DistInst -ne $Instance -or ([string]$agent.DistDb).ToUpperInvariant() -notin $readDatabases) { $agents.Add($agent) }
+    }
+    foreach ($agent in $Result.Agents) {
+        if (([string]$agent.DistDb).ToUpperInvariant() -notin $readDatabases) { continue }
+        $agent | Add-Member -NotePropertyName DistInst -NotePropertyValue $Instance -Force
+        $agents.Add($agent)
+    }
+    $indexes = New-ReplAgentIndexes $agents
+    $agentIdx = $indexes.Agents; $logReaderIdx = $indexes.LogReaders; $jobIdx = $script:jobIdx.Clone()
+    foreach ($job in $Result.Jobs) {
+        $job | Add-Member -NotePropertyName Continuous -NotePropertyValue ([string]$job.command -match '(?i)-Continuous(?:\s|$)') -Force
+        $jobIdx["$Instance|$(([string]$job.job_id).ToUpperInvariant())"] = $job
+    }
+    Update-MonArticles $Instance $Result $readDatabases
+    foreach ($edge in $edges) {
+        if ($artByPub.ContainsKey($edge.PubKey)) {
+            $edge.Tables = $artByPub[$edge.PubKey].Count
+            $edge.ArticleNames = (@($artByPub[$edge.PubKey] | ForEach-Object { "$($_.Article) $($_.Source) $($_.Destination)" }) -join ' ')
+        }
+        $kind = 'D'; if ($edge.PubType -eq 'Merge') { $kind = 'M' }
+        $key = Get-ReplAgentKey $edge.DistributorInstance $edge.DistributionDb $kind $edge.AgentId
+        $agentRow = $null; $job = $null
+        if ($agentIdx.ContainsKey($key)) { $agentRow = $agentIdx[$key] }
+        if ($agentRow -and $agentRow.job_id) {
+            $jobKey = "$($edge.DistributorInstance)|$(([string]$agentRow.job_id).ToUpperInvariant())"
+            $edge.JobKey = $jobKey
+            if ($jobIdx.ContainsKey($jobKey)) { $job = $jobIdx[$jobKey] }
+        }
+        # a pull job lives at the subscriber and is named only in its own command line
+        if (-not $job -and $edge.SubServer -and $edge.SubType -eq 'Pull') {
+            $pull = Find-PullJob $edge
+            if ($pull) { $job = $pull.Job; $edge.JobKey = "$($pull.Server)|$(([string]$pull.Job.job_id).ToUpperInvariant())" }
+        }
+        if ($job) { $edge.JobContinuous = [bool]$job.Continuous }
+        $skip = ''
+        if ($job -and $job.SkipErrors) { $skip = [string]$job.SkipErrors }
+        elseif ($agentRow -and $script:profileIdx.ContainsKey("$($edge.DistributorInstance)|$($agentRow.profile_id)")) { $skip = [string]$script:profileIdx["$($edge.DistributorInstance)|$($agentRow.profile_id)"].SkipErrors }
+        $edge.SkipErrors = $skip
+    }
+    # Build in local scope, then publish only static indexes; runtime/jobs/history stay intact.
+    $runtime = $mon; $mon = @{}
+    New-MonModel -LogReaders $logReaderIdx
+    $candidate = $mon; $mon = $runtime
+    $graph = New-ReplGraph $edges
+    $added = @($candidate.SubByKey.Keys | Where-Object { -not $runtime.SubByKey.ContainsKey($_) })
+    $removed = @($runtime.SubByKey.Keys | Where-Object { -not $candidate.SubByKey.ContainsKey($_) })
+    foreach ($name in 'Subs', 'Lrs', 'SubByKey', 'LrByKey', 'AgentKey', 'AgentByName', 'ByName', 'BySuffix', 'SessionSql') { $runtime[$name] = $candidate[$name] }
+    foreach ($name in $candidate.Targets.Keys) {
+        if ($runtime.Targets.Contains($name)) { $runtime.Targets[$name].Dist = $candidate.Targets[$name].Dist }
+    }
+    $runtime.TopologyAgents = $agents; $script:agentIdx = $agentIdx; $script:jobIdx = $jobIdx
+    foreach ($key in $added) { Add-MonEvent 'info' 'Subscription discovered by topology refresh.' $key }
+    foreach ($key in $removed) { Remove-MonRetiredState $key; Add-MonEvent 'warn' 'Subscription removed from topology.' $key }
+    if ($added.Count -or $removed.Count) {
+        $script:gServers = $graph.Servers; $script:gNodes = $graph.Nodes; $script:gLinks = $graph.Links
+        $mon.TopologyVersion++
+        if ($mon.Ui -eq 'web') { $mon.Page = Get-MonPage }
+    }
+    Update-MonModel ''
+}
+function Step-MonTopology {
+    if ($mon.Repair -or $mon.Paused) { return }
+    if (-not $mon.TopologyQueue.Count -and $TopologyEverySeconds -gt 0 -and (Get-Date) -ge $mon.TopologyNext) { $null = Start-MonTopologyRefresh }
+    if ($mon.TopologyQueue.Count -and $mon.Deferred.Count -lt 4 -and -not @($mon.Deferred | Where-Object { $_.Kind -in 'topology', 'listener', 'discovery' }).Count) {
+        $name = $mon.TopologyQueue.Dequeue()
+        if (-not $mon.Targets.Contains($name)) { return }
+        Start-MonQuery $null $mon.Targets[$name].Target @{ Kind = 'server' } 'topology' $name
+        return
+    }
+    # Article contracts: same cadence/queue as topology, single-flight, and only once topology itself
+    # is idle (Subs must be current) - deliberately not added to the other gate lists (read-only).
+    if ($mon.ContractQueue.Count -and -not $mon.TopologyQueue.Count -and $mon.Deferred.Count -lt 3 -and
+        -not @($mon.Deferred | Where-Object { $_.Kind -in 'topology', 'listener', 'discovery', 'contract' }).Count) {
+        $name = $mon.ContractQueue.Dequeue()
+        if (-not $mon.Targets.Contains($name)) { return }
+        $dbs = Get-MonContractDbNeed $name
+        if ($dbs.Count) { Start-MonQuery $null $mon.Targets[$name].Target @{ Kind = 'schema'; Dbs = $dbs } 'contract' $name }
+    }
+}
+
 function Start-LiveJob($t) {
     $t.Cycle++
     $pend = ($t.Cycle -eq 1) -or (($t.Cycle - 1) % $PendingEvery -eq 0) -or $t.PendingNow
@@ -3767,9 +5197,30 @@ function Start-LiveJob($t) {
     $ps = [powershell]::Create()
     $ps.RunspacePool = $mon.Pool
     [void]$ps.AddScript($collectText).AddArgument($t.Target).AddArgument($mon.Opt).AddArgument($task)
+    $t.TimedOut = $false; $t.StopHandle = $null
     $t.PS = $ps; $t.Handle = $ps.BeginInvoke(); $t.Started = Get-Date
     $t.Next = $t.Started.AddSeconds($mon.Interval)
 }
+# Nonblocking cancellation: a stopped task still occupies its slot until completion.
+function Test-MonJobDeadline($Job, [datetime]$Started, [datetime]$Now, [int]$Seconds = 120) {
+    if (-not $Job.ContainsKey('TimedOut')) { $Job.TimedOut = $false; $Job.StopHandle = $null }
+    if (-not $Job.Handle.IsCompleted -and -not $Job.TimedOut -and ($Now - $Started).TotalSeconds -ge $Seconds) {
+        $Job.TimedOut = $true
+        $Job.StopHandle = $Job.PS.BeginStop($null, $null)
+    }
+    if ($Job.StopHandle) {
+        if (-not $Job.StopHandle.IsCompleted) { return $false }
+        $Job.PS.EndStop($Job.StopHandle)
+        $Job.StopHandle = $null
+    }
+    return $Job.Handle.IsCompleted
+}
+function Get-MonTimeoutResult([string]$Kind) {
+    $message = 'Collector task deadline exceeded (120 seconds); task cancelled.'
+    if ($Kind -in 'repair', 'post') { $message += ' Outcome unknown: check the server before retrying; this operation is not automatically repeated.' }
+    return [pscustomobject]@{ Error = $message; ErrorNumber = 0; Probe = '' }
+}
+
 function Complete-MonJob($Ps, $Handle) {
     $r = $null
     try {
@@ -3827,13 +5278,21 @@ function Add-LiveResult($t, $r) {
     $t.Notes = @(@($t.Notes | Where-Object { $_ -like 'Sessions, blocking*' }) + $L.Notes.ToArray())   # the permission note stays
     $now = Get-Date
 
+    foreach ($db in $L.PendingStatus.Keys) {
+        $key = "$name|$($db.ToUpperInvariant())"
+        $state = $L.PendingStatus[$db]
+        $lastOk = $null
+        if ($mon.PendingStatus.ContainsKey($key)) { $lastOk = $mon.PendingStatus[$key].LastOk }
+        if ($state.Ok) { $lastOk = $state.At }
+        $mon.PendingStatus[$key] = @{ At = $state.At; LastOk = $lastOk; Ok = $state.Ok; Error = $state.Error }
+    }
     # Pending commands are counted every -PendingEvery cycles; the last count is kept in between
     foreach ($db in $L.PendingDbs) {
         $dk = "$name|$($db.ToUpperInvariant())"
         foreach ($k in @($mon.Pending.Keys | Where-Object { $_ -like "$dk|*" })) { $mon.Pending.Remove($k) }
     }
     foreach ($p in $L.Pending) { $mon.Pending["$name|$(([string]$p.Db).ToUpperInvariant())|$($p.agent_id)"] = $p }
-    $t.PendingFresh = ($L.PendingDbs.Count -gt 0)
+    $t.PendingFresh = @($L.PendingStatus.Values | Where-Object { $_.Ok }).Count -gt 0
 
     # Replication errors: MSrepl_errors rows grouped per error event, the agent from history or from the text
     $first = @{}
@@ -3844,6 +5303,11 @@ function Add-LiveResult($t, $r) {
         $got = @($L.Errors | Where-Object { ([string]$_.Db).ToUpperInvariant() -eq $db.ToUpperInvariant() } | ForEach-Object { [int]$_.id })
         $last = -1
         if ($mon.ErrLast.ContainsKey($ek)) { $last = $mon.ErrLast[$ek] }
+        if ($null -ne $max -and [int]$max -lt $last) {
+            $last = -1
+            $first[$db.ToUpperInvariant()] = $true
+            Add-MonEvent 'warn' "Replication error history reset on $ek"
+        }
         if ($got.Count) { $last = [Math]::Max($last, ($got | Measure-Object -Maximum).Maximum) }
         if ($first[$db.ToUpperInvariant()] -or -not $got.Count) { if ($null -ne $max) { $last = [Math]::Max($last, [int]$max) } }
         $mon.ErrLast[$ek] = [int]$last
@@ -3863,7 +5327,7 @@ function Add-LiveResult($t, $r) {
         $text0 = [string]$r0.error_text
         $agentK = ''
         if ($map.ContainsKey($g.Name)) { $agentK = "$name|$dbU|$($map[$g.Name].kind)|$($map[$g.Name].agent_id)" }
-        elseif ($text0 -match 'agent (\S+) (failed|scheduled for retry)' -and $mon.AgentByName.ContainsKey("$name|$($Matches[1].ToUpperInvariant())")) { $agentK = $mon.AgentByName["$name|$($Matches[1].ToUpperInvariant())"] }
+        elseif ($text0 -match 'agent (\S+) (failed|scheduled for retry)' -and $mon.AgentByName.ContainsKey("$name|$dbU|$($Matches[1].ToUpperInvariant())")) { $agentK = $mon.AgentByName["$name|$dbU|$($Matches[1].ToUpperInvariant())"] }
         if (-not $agentK) {
             # the details of an error come under the next id - also when the error itself came with the previous refresh
             $prev = $null
@@ -3946,6 +5410,19 @@ function Add-LiveResult($t, $r) {
         foreach ($k in @($mon.SessPrev.Keys | Where-Object { $_.StartsWith("$name|") -and -not $seen.Contains($_) })) { $mon.SessPrev.Remove($k) }
     }
     $mon.Raw[$name] = $L
+}
+
+# A failed refresh is unknown immediately. An overdue successful sample is stale.
+function Get-MonPendingSample([string]$DbKey, [datetime]$Now) {
+    $ttl = [Math]::Max(60, 3 * $mon.Interval * [Math]::Max(1, $PendingEvery))
+    if (-not $mon.PendingStatus.ContainsKey($DbKey)) { return @{ status = 'unknown'; age = $null; error = ''; usable = $false } }
+    $sample = $mon.PendingStatus[$DbKey]
+    $age = $null
+    if ($null -ne $sample.LastOk) { $age = [Math]::Max(0, ($Now - $sample.LastOk).TotalSeconds) }
+    $status = 'ok'
+    if (-not $sample.Ok) { $status = 'error' }
+    elseif ($null -eq $age -or $age -gt $ttl) { $status = 'stale' }
+    return @{ status = $status; age = $age; error = $sample.Error; usable = ($status -eq 'ok') }
 }
 
 # Everything the page shows, rebuilt after each server answers
@@ -4119,10 +5596,10 @@ function Update-MonModel([string]$From) {
         $agentId = $s.AgentId
         if ($hr -and $hr.AgentId) {
             $agentId = [string]$hr.AgentId
-            if (-not $mon.AgentKey.ContainsKey("$($s.DbKey)|D|$agentId")) { $mon.AgentKey["$($s.DbKey)|D|$agentId"] = @{ k = $s.Key; lbl = $s.Label } }
+            if (-not $mon.AgentKey.ContainsKey("$($s.DbKey)|$($s.AgentKind)|$agentId")) { $mon.AgentKey["$($s.DbKey)|$($s.AgentKind)|$agentId"] = @{ k = $s.Key; lbl = $s.Label } }
         }
         $s.AgentId = $agentId
-        $ar = $aIdx["$($s.DbKey)|D|$agentId"]
+        $ar = $aIdx["$($s.DbKey)|$($s.AgentKind)|$agentId"]
         $lvl = 'unknown'; $p = New-Object System.Collections.Generic.List[string]; $st = ''
         if ($hr) { $lvl = $hr.Level; foreach ($x in $hr.Problems) { $p.Add($x) }; $st = $hr.AgentStatus }
         elseif ($tg.Ok -eq $false) { $p.Add('DISTRIBUTOR NOT REACHABLE') }
@@ -4154,11 +5631,13 @@ function Update-MonModel([string]$From) {
         }
         $pd = $null; $eta = $null; $old = $null
         $pk = "$($s.DbKey)|$agentId"
-        if ($mon.Pending.ContainsKey($pk)) {
+        $pendingSample = Get-MonPendingSample $s.DbKey (Get-Date)
+        if ($s.AgentKind -eq 'D' -and -not $pendingSample.usable) { $lvl = Get-Worse $lvl 'unknown'; $p.Add('PENDING ' + $pendingSample.status.ToUpperInvariant()) }
+        if ($s.AgentKind -eq 'D' -and $pendingSample.usable -and $mon.Pending.ContainsKey($pk)) {
             $pr = $mon.Pending[$pk]
             $pd = [long]$pr.pending
             if ($pd -gt 0) {
-                if ($pr.rate -gt 0) { $eta = [int]($pd / [double]$pr.rate) }
+                if ($pr.rate -gt 0) { $eta = [double]($pd / [double]$pr.rate) }
                 $old = Get-Secs $pr.oldest_entry $pr.now
             }
             if ($pd -ge $PendingWarn) { $lvl = Get-Worse $lvl 'warn'; $p.Add("PENDING $pd") }
@@ -4186,9 +5665,10 @@ function Update-MonModel([string]$From) {
         }
         if ($fresh -and $From -eq $s.DistInst) {
             Add-MonHist $s.Key 'lat' $lat; Add-MonHist $s.Key 'rt' $rate
-            if ($tg.PendingFresh) { Add-MonHist $s.Key 'pd' $pd }
+            if ($tg.PendingFresh -or -not $pendingSample.usable) { Add-MonHist $s.Key 'pd' $pd }
         }
         $subOut.Add([ordered]@{ k = $s.Key; h = $lvl; p = ($p -join ', '); st = $st; lat = $lat; lh = (Get-MonHist $s.Key 'lat'); pd = $pd
+                                pendingStatus = $pendingSample.status; pendingAge = $pendingSample.age; pendingError = $pendingSample.error
                                 ph = (Get-MonHist $s.Key 'pd'); eta = $eta; old = $old; rt = $rate; rh = (Get-MonHist $s.Key 'rt'); last = $last
                                 age = $age; msg = $msg; job = $job; ses = $ses; blk = $blk; wt = (Get-MonWait $ses); agent = $agentId })
     }
@@ -4309,11 +5789,13 @@ function Get-MonStateJson {
     })
     $o = [ordered]@{
         seq = $mon.Seq; time = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture); paused = $mon.Paused; interval = $mon.Interval
+        topologyVersion = $mon.TopologyVersion
         sum = (Get-MonSummary); servers = $servers; subs = $mon.Out.Subs; lrs = $mon.Out.Lrs; blocking = $mon.Out.Blocking
         sessions = $mon.Out.Sessions; waits = @($mon.Waits.Values); agentWaits = $agentWaits; ag = $mon.Out.Ag
         errors = @($mon.Errors | ForEach-Object { [ordered]@{ key = $_.key; t = $_.t; srv = $_.srv; db = $_.db; k = $_.k; lbl = $_.lbl; code = $_.code
                                                               m = $_.m; more = $_.more; seq = $_.seq; cmd = $_.cmd } })
         events = $mon.Events
+        contracts = $articleContractRows.ToArray(); contractsAt = $mon.ContractAt
     }
     $mon.Json = ConvertTo-FastJson $o
     $mon.JsonSeq = $mon.Seq
@@ -4328,7 +5810,7 @@ function Receive-MonRequest($Cl) {
         $n = $stream.Read($buf, 0, $buf.Length)
         if ($n -le 0) { break }
         $Cl.M.Write($buf, 0, $n)
-        if ($Cl.M.Length -gt 1MB) { throw 'Request too large' }
+        if ($Cl.M.Length -gt 16KB) { throw 'Request too large' }
     }
     $bytes = $Cl.M.ToArray()
     $text = [Text.Encoding]::ASCII.GetString($bytes)
@@ -4380,15 +5862,23 @@ function Send-MonJson($C, $Obj, [int]$Code = 200) { Send-MonResponse $C $Code 'a
 
 # A detail, command or tracer query runs in the background; the browser (or the console) gets the answer later
 function Start-MonQuery($C, [string]$Target, $Task, [string]$Kind, $Extra) {
+    if ($mon.Deferred.Count -ge 4) { throw 'On-demand query limit reached; retry after a running query completes.' }
+    $signature = "$Target|$Kind|$Extra|" + (ConvertTo-FastJson $Task)
+    foreach ($active in $mon.Deferred) {
+        if ($active.Signature -ceq $signature) { throw 'This query is already running; wait for its result.' }
+    }
     $ps = [powershell]::Create()
-    $ps.RunspacePool = $mon.Pool
+    $ps.RunspacePool = $mon.RequestPool
     [void]$ps.AddScript($collectText).AddArgument($Target).AddArgument($mon.Opt).AddArgument($Task)
-    $mon.Deferred.Add(@{ C = $C; PS = $ps; Handle = $ps.BeginInvoke(); Kind = $Kind; Extra = $Extra; T = Get-Date })
+    $identity = ''
+    if ($Kind -eq 'detail') { $identity = Get-MonErrorIdentity ([string]$Extra) }
+    $mon.Deferred.Add(@{ ErrorIdentity = $identity; C = $C; PS = $ps; Handle = $ps.BeginInvoke(); Kind = $Kind; Signature = $signature; Extra = $Extra; T = Get-Date })
 }
 # The three on-demand queries; $null = started, otherwise the reason why not
 function Start-MonDetail($C, [string]$Key, [int]$Hours) {
     if ($mon.SubByKey.ContainsKey($Key)) {
         $s = $mon.SubByKey[$Key]
+        if ($s.Edge.PubType -eq 'Merge') { return 'Merge detail is not supported.' }
         if (-not $s.AgentId) { return 'The Distribution Agent of this subscription is not known yet.' }
         $task = @{ Kind = 'detail'; Mode = 'sub'; Db = $s.DistDb; AgentId = $s.AgentId; AgentName = $s.AgentName; Hours = $Hours
                    Publication = $s.Edge.Publication; Pending = ($s.Edge.PubType -eq 'Transactional') }
@@ -4398,7 +5888,7 @@ function Start-MonDetail($C, [string]$Key, [int]$Hours) {
     if ($mon.LrByKey.ContainsKey($Key)) {
         $l = $mon.LrByKey[$Key]
         $name = ''
-        if ($agentIdx.ContainsKey("$($l.DistInst)|L|$($l.AgentId)")) { $name = [string]$agentIdx["$($l.DistInst)|L|$($l.AgentId)"].name }
+        if ($agentIdx.ContainsKey("$($l.DistInst)|$($l.DistDb)|L|$($l.AgentId)")) { $name = [string]$agentIdx["$($l.DistInst)|$($l.DistDb)|L|$($l.AgentId)"].name }
         $task = @{ Kind = 'detail'; Mode = 'lr'; Db = $l.DistDb; AgentId = $l.AgentId; AgentName = $name; Hours = $Hours; Pending = $false }
         Start-MonQuery $C $mon.Targets[$l.DistInst].Target $task 'detail' $Key
         return $null
@@ -4427,14 +5917,19 @@ function Start-MonTracer($C, [string]$Key) {
 }
 # ---- repairs and AI reports in the monitor (web page and console share these) ----
 # Problem of a subscription / Log Reader from the live model, the recent errors and the last detail that was loaded
+function Get-MonErrorIdentity([string]$Key) {
+    foreach ($errorRow in $mon.Errors) {
+        if ($errorRow.k -eq $Key) { return "$($errorRow.srv)|$($errorRow.db)|$($errorRow.id)|$($errorRow.seq)|$($errorRow.time0.ToString('o'))" }
+    }
+    return 'none'
+}
 function Get-MonProblem([string]$Key) {
-    $P = New-Problem; $P.Key = $Key; $x = $null; $jobKey = ''
+    $P = New-Problem; $P.Key = $Key; $P.ErrorIdentity = Get-MonErrorIdentity $Key; $x = $null; $jobKey = ''
     if ($mon.SubByKey.ContainsKey($Key)) {
         $s = $mon.SubByKey[$Key]; $e = $s.Edge
-        $P.Kind = 'sub'; $P.Label = $s.Label; $jobKey = [string]$s.JobKey
-        $P.PubServer = [string]$e.PubServer; $P.PubName = [string]$e.PubServerRaw; $P.PubDb = [string]$e.PubDb; $P.Publication = [string]$e.Publication; $P.PubType = [string]$e.PubType
-        $P.SubServer = [string]$e.SubServer; $P.SubName = [string]$e.SubServerRaw; $P.SubDb = [string]$e.SubDb; $P.SubType = [string]$e.SubType
-        $P.DistServer = [string]$s.DistInst; $P.DistDb = [string]$s.DistDb
+        Set-ProblemSubscription $P $e
+        $P.Label = $s.Label; $jobKey = [string]$s.JobKey
+        $P.DistServer = [string]$s.DistInst; $P.DistDb = [string]$s.DistDb; $P.AgentId = [string]$s.AgentId
         foreach ($o in $mon.Out.Subs) { if ($o.k -eq $Key) { $x = $o; break } }
     } elseif ($mon.LrByKey.ContainsKey($Key)) {
         $l = $mon.LrByKey[$Key]
@@ -4442,13 +5937,8 @@ function Get-MonProblem([string]$Key) {
         $P.PubServer = [string]$l.Publisher; $P.PubDb = [string]$l.PubDb; $P.DistServer = [string]$l.DistInst; $P.DistDb = [string]$l.DistDb
         foreach ($o in $mon.Out.Lrs) { if ($o.k -eq $Key) { $x = $o; break } }
     } else { return $null }
-    if ($x) { $P.Level = [string]$x.h; $P.Problem = [string]$x.p; $P.Status = [string]$x.st; $P.Msg = [string]$x.msg; $P.Job = [string]$x.job }
-    if ($jobKey) {
-        $P.JobSrv = ($jobKey -split '\|')[0]; $P.JobId = ($jobKey -split '\|')[1]
-        if ($serverInfo.ContainsKey($P.JobSrv)) {
-            foreach ($j in $serverInfo[$P.JobSrv].Jobs) { if (([string]$j.job_id).ToUpperInvariant() -eq $P.JobId) { $P.JobName = [string]$j.name; break } }
-        }
-    }
+    Set-ProblemJob $P $jobKey
+    if ($x) { $P.Level = [string]$x.h; $P.Problem = [string]$x.p; $P.Status = [string]$x.st; $P.Msg = [string]$x.msg; if ($x.job) { $P.Job = [string]$x.job } }
     $text = New-Object System.Collections.Generic.List[string]
     $text.Add($P.Problem); $text.Add($P.Msg)
     $n = 0
@@ -4461,13 +5951,13 @@ function Get-MonProblem([string]$Key) {
         if ("$($er.code)" -match '^-?\d+$') { $P.Codes.Add([int]"$($er.code)") }
         foreach ($m in $er.more) { if ($m -match '^(-?\d+):') { $P.Codes.Add([int]$Matches[1]) }; $text.Add([string]$m) }
         $text.Add([string]$er.m)
-        if (-not $P.Seq -and $er.seq) { $P.Seq = ([string]$er.seq).Substring(0, [Math]::Min(22, ([string]$er.seq).Length)) }
+        if (-not $P.Seq -and $er.seq) { $P.ErrorId = [int]$er.id; $P.ExpectedSeq = [string]$er.seq; $P.Seq = ([string]$er.seq).Substring(0, [Math]::Min(22, ([string]$er.seq).Length)) }
     }
-    if ($mon.LastDetail.ContainsKey($Key)) {
+    if ($mon.LastDetail.ContainsKey($Key) -and $mon.DetailIdentity[$Key] -ceq $P.ErrorIdentity) {
         $d = $mon.LastDetail[$Key]
-        if ($d.Fail) { $P.Fail = $d.Fail; $P.Seq = [string]$d.Fail.seq }
+        if ($d.Fail -and $P.Seq -and ([string]$d.Fail.seq).StartsWith($P.Seq, [StringComparison]::OrdinalIgnoreCase)) { $P.Fail = $d.Fail }
     }
-    if ($P.Fail -and $P.Fail.article) { $P.ArtFilter = $artFilter["$($P.PubServer)|$($P.PubDb)|$($P.Publication)|$($P.Fail.article)".ToUpperInvariant()] }
+    Set-ProblemArtFilter $P
     # a transaction skipped already is not offered again until the agent reports the next one (about a minute)
     if ($P.Seq -and $mon.Skipped.ContainsKey($Key) -and $mon.Skipped[$Key] -eq $P.Seq) { $P.Seq = '' }
     $P.Text = ($text | Where-Object { $_ }) -join ' | '
@@ -4478,54 +5968,74 @@ function Get-MonRepairs([string]$Key) {
     if (-not $P) { return , @() }
     return , (Get-RepairActions $P)
 }
+# Fingerprint of what a repair will run; the client sends it back so a changed action is refused
+function Get-RepairHash($A) {
+    $t = [string]$A['context'] + '|' + (@($A.steps | ForEach-Object { "$($_.srv)|$($_.db)|$($_.sql)" }) -join "`n")
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($t))) -replace '-', '').Substring(0, 16) } finally { $sha.Dispose() }
+}
 function ConvertTo-RepairJson([string]$Label, $Acts) {
     return , @(foreach ($a in $Acts) {
         [ordered]@{ id = $a.id; title = $a.title; level = $a.level; why = $a.why; risk = $a.risk; undo = $a.undo; check = $a.check
-                    confirm = $a.confirm; run = (Test-RepairAllowed $a); sql = (Format-RepairScript $Label $a) }
+                    confirm = $a.confirm; h = (Get-RepairHash $a); run = (Test-RepairAllowed $a); sql = (Format-RepairScript $Label $a) }
     })
 }
 function Write-RepairLog([string]$Text) {
     try {
         if (-not (Test-Path -LiteralPath $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
-        Add-Content -LiteralPath (Join-Path $OutputDir 'repairs.log') -Value ('{0} {1}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), $Text) -Encoding UTF8
+        Add-Content -LiteralPath (Join-Path $OutputDir 'repairs.log') -Value ('{0} {1}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), ($Text -replace '[\r\n]+', ' ')) -Encoding UTF8 -ErrorAction Stop
     } catch {
         $m = "Cannot write repairs.log in $OutputDir (-OutputDir): $($_.Exception.Message)"
         if ($m -ne $mon.LastFault) { $mon.LastFault = $m; Add-MonEvent 'error' $m }
+        throw $m
     }
 }
 # Runs one repair, step after step; $null = started, otherwise the reason why not
-function Start-MonRepair($C, [string]$Key, [int]$FindId, [string]$ActionId, [string]$Phrase) {
-    if ($mon.Repair) { return 'Another repair is running - wait until it ends.' }
+# Logs a refused repair and returns the reason
+function Deny-MonRepair([string]$Id, [string]$Why) { try { Write-RepairLog "REFUSED $Id | $Why" } catch { return "$Why Log unavailable: $($_.Exception.Message)" }; return $Why }
+function Start-MonRepair($C, [string]$Key, [int]$FindId, [string]$ActionId, [string]$Phrase, [string]$Hash) {
+    if ($mon.TopologyQueue.Count -or $mon.DiscoveryQueue.Count -or @($mon.Deferred | Where-Object { $_.Kind -in 'topology', 'listener', 'discovery' }).Count) { return 'Wait for topology refresh to finish before repairing.' }
+    if ($mon.Repair) { return (Deny-MonRepair $ActionId 'Another repair is running - wait until it ends.') }
     $label = ''; $acts = @()
     if ($Key) {
         $P = Get-MonProblem $Key
-        if (-not $P) { return 'Unknown item.' }
+        if (-not $P) { return (Deny-MonRepair $ActionId 'Unknown item.') }
         $label = $P.Label; $acts = (Get-RepairActions $P)
     } elseif ($FindId -ge 0 -and $FindId -lt $findings.Count) {
         $f = $findings[$FindId]; $label = "$($f.Server) $($f.Object)"; $acts = (Get-FindingRepairs $f)
-    } else { return 'Unknown item.' }
+    } else { return (Deny-MonRepair $ActionId 'Unknown item.') }
     $a = $null
     foreach ($x in $acts) { if ($x.id -eq $ActionId) { $a = $x } }
-    if (-not $a) { return 'This repair does not apply any more - the state has changed. Reload the detail.' }
-    if ($a.level -eq 'script') { return 'This repair is a script only (it needs a password or a decision) - save it and run it in SSMS.' }
+    if (-not $a) { return (Deny-MonRepair $ActionId 'This repair does not apply any more - the state has changed. Reload the detail.') }
+    if ($Hash -cne (Get-RepairHash $a)) { return (Deny-MonRepair $ActionId 'This repair changed since it was shown (new data arrived). Reload the detail and read it again.') }
+    if ($a.level -eq 'script') { return (Deny-MonRepair $ActionId 'This repair is a script only (it needs a password or a decision) - save it and run it in SSMS.') }
     if (-not (Test-RepairAllowed $a)) {
-        if ($a.level -eq 'full') { return 'This repair needs the monitor started with -AllowAllRepair.' }
-        return 'Repairs need the monitor started with -AllowRepair (or -AllowAllRepair).'
+        if ($a.level -eq 'full') { return (Deny-MonRepair $ActionId 'This repair needs the monitor started with -AllowAllRepair.') }
+        return (Deny-MonRepair $ActionId 'Repairs need the monitor started with -AllowRepair (or -AllowAllRepair).')
     }
-    if ($a.level -eq 'full') { if (([string]$Phrase).Trim() -cne $a.confirm) { return "Not confirmed - type $($a.confirm) to run this repair." } }
-    elseif ($Phrase -ne 'yes') { return 'Not confirmed.' }
+    if ($a.level -eq 'full') { if (([string]$Phrase).Trim() -cne $a.confirm) { return (Deny-MonRepair $ActionId "Not confirmed - type $($a.confirm) to run this repair.") } }
+    elseif ($Phrase -ne 'yes') { return (Deny-MonRepair $ActionId 'Not confirmed.') }
     $seq = ''
     if ($Key -and $a.id -eq 'skip-tx') { $seq = $P.Seq }
+    try { Write-RepairLog "START [$($a.level)] $($a.title) | $label | $authText" } catch { return $_.Exception.Message }
     $mon.Repair = @{ C = $C; A = $a; Label = $label; Step = 0; Key = $Key; Seq = $seq }
-    Write-RepairLog "START [$($a.level)] $($a.title) | $label | $authText"
     Add-MonEvent 'warn' "Repair started: $($a.title) - $label" $Key
     Start-MonRepairStep
     return $null
 }
 function Start-MonRepairStep {
     $r = $mon.Repair; $s = $r.A.steps[$r.Step]
-    Write-RepairLog ('  step {0}/{1} on {2} / {3}: {4}' -f ($r.Step + 1), $r.A.steps.Count, $s.srv, $s.db, ($s.sql -replace '\s+', ' '))
-    Start-MonQuery $r.C (Get-Target $s.srv) @{ Kind = 'repair'; Db = $s.db; Sql = $s.sql } 'repair' $r.Step
+    try {
+        Write-RepairLog ('  step {0}/{1} on {2} / {3}: {4}' -f ($r.Step + 1), $r.A.steps.Count, $s.srv, $s.db, ($s.sql -replace '\s+', ' '))
+    } catch {
+        $mon.Repair = $null
+        $message = "Repair stopped before step $($r.Step + 1); $($r.Step) steps completed. Check job state on the server. $($_.Exception.Message)"
+        Add-MonEvent 'error' $message $r.Key
+        if ($r.C) { Send-MonJson $r.C @{ error = $message } } else { Set-ConMsg $message }
+        return
+    }
+    try { Start-MonQuery $r.C (Get-Target $s.srv) @{ Kind = 'repair'; Db = $s.db; Sql = $s.sql } 'repair' $r.Step }
+    catch { Complete-MonRepair ([pscustomobject]@{ Error = $_.Exception.Message; ErrorNumber = 0; Probe = '' }) }
 }
 function Complete-MonRepair($Res) {
     $r = $mon.Repair
@@ -4534,8 +6044,8 @@ function Complete-MonRepair($Res) {
     if ($Res.Error) { $err = Get-ConnHint $Res 'server' } elseif ($Res.Repair -and $Res.Repair.Error) { $err = $Res.Repair.Error }
     $s = $r.A.steps[$r.Step]
     if ($err) {
-        Write-RepairLog "  FAILED: $err"
-        $msg = "Repair failed at step $($r.Step + 1) of $($r.A.steps.Count) ($($s.srv) / $($s.db)): $err"
+        try { Write-RepairLog "  FAILED: $err" } catch { $err += "; log unavailable: $($_.Exception.Message)" }
+        $msg = "Repair failed at step $($r.Step + 1) of $($r.A.steps.Count) ($($s.srv) / $($s.db)): $err. $($r.Step) earlier steps completed; verify job state before retrying."
         Add-MonEvent 'error' "$msg - $($r.A.title), $($r.Label)" $r.Key
         $mon.Repair = $null
         if ($r.C) { Send-MonJson $r.C ([ordered]@{ error = $msg }) } else { Set-ConMsg $msg }
@@ -4543,33 +6053,47 @@ function Complete-MonRepair($Res) {
     }
     $r.Step++
     if ($r.Step -lt $r.A.steps.Count) { Start-MonRepairStep; return }
-    Write-RepairLog '  DONE'
+    $logError = ''
+    try { Write-RepairLog '  DONE' } catch { $logError = " Log unavailable after completed SQL: $($_.Exception.Message)" }
     if ($r.Seq) { $mon.Skipped[$r.Key] = $r.Seq }
-    $msg = "Repair done: $($r.A.title). $($r.A.check)"
+    if ($r.Key) { [void]$mon.LastDetail.Remove($r.Key) }
+    $msg = "Repair done: $($r.A.title). $($r.A.check)$logError"
     Add-MonEvent 'info' "$msg - $($r.Label)" $r.Key
     $mon.Repair = $null
     foreach ($t in $mon.Targets.Values) { $t.Next = Get-Date; $t.PendingNow = $true }   # show the effect at once
     if ($r.C) { Send-MonJson $r.C ([ordered]@{ ok = $true; message = $msg }) } else { Set-ConMsg $msg }
 }
 # Report for an AI assistant about one subscription / Log Reader (what the monitor knows now plus the last detail)
-function New-MonAiReport([string]$Key) {
+function New-MonAiReport([string]$Key, [switch]$Preview) {
     $P = Get-MonProblem $Key
     if (-not $P) { return [pscustomobject]@{ Error = 'Unknown item.' } }
     $x = $null
     foreach ($o in $mon.Out.Subs) { if ($o.k -eq $Key) { $x = $o } }   # @(List) throws in PowerShell 7.4
     foreach ($o in $mon.Out.Lrs) { if ($o.k -eq $Key) { $x = $o } }
     $d = $null
-    if ($mon.LastDetail.ContainsKey($Key)) { $d = $mon.LastDetail[$Key] }
+    if ($mon.LastDetail.ContainsKey($Key) -and $mon.DetailIdentity[$Key] -ceq (Get-MonErrorIdentity $Key)) { $d = $mon.LastDetail[$Key] }
     $mask = New-AiMasker; Add-AiKnownNames $mask   # not $M: PowerShell names ignore case and the loops use $m
-    foreach ($r in $mon.Out.Sessions) { Add-AiName $mask ([string]$r.host) 'HOST' }
+    foreach ($r in $mon.Out.Sessions) { Add-AiName $mask ([string]$r.host) 'HOST'; if ($r.PSObject.Properties['hHost']) { Add-AiName $mask ([string]$r.hHost) 'HOST' } }
+    foreach ($r in $mon.Out.Blocking) { Add-AiName $mask ([string]$r.hHost) 'HOST' }
+    $nameFields = @{ PubServer = 'SRV'; SubServer = 'SRV'; DistServer = 'SRV'; PubDb = 'DB'; SubDb = 'DB'; DistDb = 'DB'; Publication = 'PUB'; JobName = 'JOB' }
+    foreach ($field in $nameFields.Keys) { Add-AiName $mask ([string]$P.$field) $nameFields[$field] }
+    if ($d) {
+        if ($d.Fail) {
+            foreach ($field in 'srcOwner', 'dstOwner') { Add-AiName $mask ([string]$d.Fail.$field) 'SCH' }
+            foreach ($field in 'src', 'dst', 'article') { Add-AiName $mask ([string]$d.Fail.$field) 'TAB' }
+        }
+        foreach ($row in $d.Articles) { Add-AiName $mask ([string]$row.a) 'TAB' }
+    }
+    $shown = @{}
+    foreach ($field in $nameFields.Keys) { $shown[$field] = Protect-AiNameField $mask ([string]$P.$field) }
     $L = New-Object System.Collections.Generic.List[string]
     $L.Add('# SQL Server replication problem - report for an AI assistant'); $L.Add('')
     foreach ($q in $aiQuestion) { $L.Add($q) }
     $L.Add(''); $L.Add("Collected by Get-ReplTopology.ps1 $scriptVersion (live monitor) on $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)).")
     $L.Add(''); $L.Add('## The item')
     if ($P.Kind -eq 'sub') {
-        $L.Add("- Subscription of the $($P.PubType) publication $($P.Publication): publisher $($P.PubServer) / $($P.PubDb) -> subscriber $($P.SubServer) / $($P.SubDb) ($($P.SubType)); distributor $($P.DistServer) / $($P.DistDb)")
-    } else { $L.Add("- Log Reader of $($P.PubServer) / $($P.PubDb); distributor $($P.DistServer) / $($P.DistDb)") }
+        $L.Add("- Subscription of the $($P.PubType) publication $($shown.Publication): publisher $($shown.PubServer) / $($shown.PubDb) -> subscriber $($shown.SubServer) / $($shown.SubDb) ($($P.SubType)); distributor $($shown.DistServer) / $($shown.DistDb)")
+    } else { $L.Add("- Log Reader of $($shown.PubServer) / $($shown.PubDb); distributor $($shown.DistServer) / $($shown.DistDb)") }
     foreach ($srv in @($P.PubServer, $P.SubServer)) {
         if ($srv -and $agByListener.ContainsKey($srv)) {
             $ag = $ags[$agByListener[$srv]]
@@ -4577,7 +6101,7 @@ function New-MonAiReport([string]$Key) {
         }
     }
     $L.Add("- Health: $($P.Level) - $($P.Problem)")
-    $L.Add("- Agent status: $($P.Status); agent job: $($P.Job) $($P.JobName)")
+    $L.Add("- Agent status: $($P.Status); agent job: $($P.Job) $($shown.JobName)")
     if ($x) {
         $facts = @()
         foreach ($f in @(@('latency s', 'lat'), @('pending commands', 'pd'), @('oldest undelivered transaction s', 'old'), @('commands/s', 'rt'), @('last agent entry s ago', 'age'), @('delivered commands', 'cmds'))) {
@@ -4650,10 +6174,15 @@ function New-MonAiReport([string]$Key) {
     if ($acts.Count) { $L.Add(''); $L.Add('## Repairs the tool offers for this problem'); foreach ($a in $acts) { $L.Add("- $($a.title) [$($a.level)]: $($a.why)") } }
     $base = 'ai-subscription'
     if ($P.Kind -eq 'lr') { $base = 'ai-logreader' }
-    return Save-AiReport ($L -join "`n") $mask $base
+    return Save-AiReport ($L -join "`n") $mask $base -Preview:$Preview
 }
 function Complete-MonQuery($D) {
     $r = Complete-MonJob $D.PS $D.Handle
+    if ($D.TimedOut) { $r = Get-MonTimeoutResult $D.Kind }
+    if ($D.Kind -eq 'discovery') { Apply-MonDiscoveryResult $D.Extra $r; return }
+    if ($D.Kind -eq 'listener') { Apply-MonListenerResult ([string]$D.Extra) $r; return }
+    if ($D.Kind -eq 'topology') { Apply-MonTopologyResult ([string]$D.Extra) $r; return }
+    if ($D.Kind -eq 'contract') { Apply-MonArticleContractResult ([string]$D.Extra) $r; return }
     if ($D.Kind -eq 'repair') { Complete-MonRepair $r; return }
     $err = ''
     if ($r.Error) { $err = Get-ConnHint $r 'server' }
@@ -4663,7 +6192,7 @@ function Complete-MonQuery($D) {
         $e = $mon.SubByKey[$D.Extra].Edge
         Add-MonEvent 'info' "Tracer token $($x.TracerId) posted: $($e.Publication) on $($e.PubServer)/$($e.PubDb)" $D.Extra
     }
-    if ($D.Kind -eq 'detail' -and $x) { $mon.LastDetail[$D.Extra] = $x }   # for the repairs and the AI report
+    if ($D.Kind -eq 'detail' -and $x -and $D.ErrorIdentity -ceq (Get-MonErrorIdentity ([string]$D.Extra))) { $mon.LastDetail[$D.Extra] = $x; $mon.DetailIdentity[$D.Extra] = $D.ErrorIdentity }   # for the repairs and the AI report
     if (-not $D.C) { Complete-ConQuery $D $x $err; return }
     if ($err) { Send-MonJson $D.C ([ordered]@{ error = $err }); return }
     switch ($D.Kind) {
@@ -4681,6 +6210,7 @@ function Invoke-MonControl([string]$Action, $Value) {
     switch ($Action) {
         'pause' { $mon.Paused = $true; Add-MonEvent 'info' 'Refresh paused' }
         'resume' { $mon.Paused = $false; foreach ($t in $mon.Targets.Values) { $t.Next = Get-Date }; Add-MonEvent 'info' 'Refresh resumed' }
+        'topology' { return (Start-MonTopologyRefresh) }
         'refresh' { foreach ($t in $mon.Targets.Values) { $t.Next = Get-Date; $t.PendingNow = $true } }
         'interval' {
             if ("$Value" -notmatch '^\d+$') { return 'The interval must be a number of seconds.' }
@@ -4694,17 +6224,38 @@ function Invoke-MonControl([string]$Action, $Value) {
     return $null
 }
 
+function Test-MonTokenEqual([string]$Expected, [string]$Actual) {
+    if ([string]::IsNullOrEmpty($Expected) -or [string]::IsNullOrEmpty($Actual)) { return $false }
+    $eb = [System.Text.Encoding]::UTF8.GetBytes($Expected)
+    $ab = [System.Text.Encoding]::UTF8.GetBytes($Actual)
+    $diff = $eb.Length -bxor $ab.Length
+    $len = [Math]::Max($eb.Length, $ab.Length)
+    for ($i = 0; $i -lt $len; $i++) {
+        $x = if ($i -lt $eb.Length) { $eb[$i] } else { 0 }
+        $y = if ($i -lt $ab.Length) { $ab[$i] } else { 0 }
+        $diff = $diff -bor ($x -bxor $y)
+    }
+    return ($diff -eq 0)
+}
+
 function Invoke-MonRequest($C, $Req) {
     $p = $Req.Path
     if ($p -eq '/favicon.ico') { Send-MonResponse $C 204 'text/plain' $null; return }
     # The page and the library accept the key from the URL; the API only from the X-Token header
-    $tok = $Req.Headers['x-token']
-    if (-not $p.StartsWith('/api/') -and -not $tok) { $tok = $Req.Query['t'] }
-    if ($tok -ne $mon.Token) {
+    $tok = [string]$Req.Headers['x-token']
+    if (-not $p.StartsWith('/api/') -and -not $tok) { $tok = [string]$Req.Query['t'] }
+    $isOperator = Test-MonTokenEqual $mon.Token $tok
+    $viewer = (Test-MonTokenEqual $mon.ViewToken $tok) -and (-not $isOperator)
+    if (-not $isOperator -and -not $viewer) {
         Send-MonResponse $C 403 'text/html; charset=utf-8' '<!doctype html><meta charset="utf-8"><title>Replication Monitor</title><p style="font-family:sans-serif">Open the address printed in the PowerShell window - it contains the access key.</p>'
         return
     }
-    if ($p -eq '/') { Send-MonResponse $C 200 'text/html; charset=utf-8' $mon.Page; return }
+    if ($viewer -and $p -notin '/', '/mermaid.min.js', '/api/state') { Send-MonJson $C @{ error = 'Operator access required.' } 403; return }
+    if ($p -eq '/') {
+        $page = $mon.Page
+        if ($viewer) { $page = $page.Replace($mon.Token, $mon.ViewToken).Replace("const VIEW_ONLY = 'false'", "const VIEW_ONLY = 'true'") }
+        Send-MonResponse $C 200 'text/html; charset=utf-8' $page; return
+    }
     if ($p -eq '/mermaid.min.js') {
         if ($mon.Lib) { Send-MonResponse $C 200 'application/javascript; charset=utf-8' $mon.Lib 'private, max-age=86400' }
         else { Send-MonResponse $C 404 'text/plain' 'mermaid.min.js was not found next to the script' }
@@ -4729,12 +6280,17 @@ function Invoke-MonRequest($C, $Req) {
     } elseif ($p -eq '/api/repair') {
         $fid = -1
         if ([string]$Req.Query['f'] -match '^\d+$') { $fid = [int]$Req.Query['f'] }
-        $why = Start-MonRepair $C ([string]$Req.Query['k']) $fid ([string]$Req.Query['a']) ([string]$Req.Query['c'])
+        $why = Start-MonRepair $C ([string]$Req.Query['k']) $fid ([string]$Req.Query['a']) ([string]$Req.Query['c']) ([string]$Req.Query['h'])
     } elseif ($p -eq '/api/aireport') {
         try {
-            $ai = New-MonAiReport ([string]$Req.Query['k'])
+            $previewId = ''
+            if ($Req.Query['save']) { $ai = Save-MonAiPreview ([string]$Req.Query['save']) }
+            else {
+                $ai = New-MonAiReport ([string]$Req.Query['k']) -Preview:($Req.Query['preview'] -eq '1')
+                if ($Req.Query['preview'] -eq '1' -and -not $ai.PSObject.Properties['Error']) { $previewId = Register-MonAiPreview $ai }
+            }
             if ($ai.PSObject.Properties['Error']) { $why = $ai.Error }
-            else { Send-MonJson $C ([ordered]@{ file = $ai.File; map = $ai.Map; md = $ai.Text; masked = (-not $NoMask) }); return }
+            else { Send-MonJson $C ([ordered]@{ file = $ai.File; map = $ai.Map; md = $ai.Text; masked = (-not $NoMask); validation = $ai.Validation; preview = $previewId }); return }
         } catch { $why = "The report could not be written: $($_.Exception.Message)" }
     } elseif ($p -eq '/api/control') {
         $why = Invoke-MonControl ([string]$Req.Query['a']) $Req.Query['v']
@@ -4808,7 +6364,9 @@ function Format-ConNum($v, [int]$Dec = 0) {
 }
 function Format-ConAge($s) {
     if ($null -eq $s -or "$s" -eq '') { return '' }
-    $s = [int]$s
+    $s = [double]$s
+    if ([double]::IsNaN($s) -or [double]::IsInfinity($s) -or $s -gt 3155760000) { return '>100 years' }
+    $s = [long][math]::Round($s)
     if ($s -lt 60) { return "$s s" }
     if ($s -lt 3600) { return "$([int][math]::Floor($s / 60)) min" }
     if ($s -lt 86400) { return "$([int][math]::Floor($s / 3600)) h $([int][math]::Floor(($s % 3600) / 60)) min" }
@@ -4870,7 +6428,7 @@ function Write-ConFrame($Lines, [int]$W, [int]$H) {
         if ($ln) {
             foreach ($s in $ln.Segs) {
                 if ($used -ge $W) { break }
-                $t = $s[0] -replace '[\r\n\t]', ' '
+                $t = $s[0] -replace '[\x00-\x1f\x7f]', ' '
                 if ($t.Length -gt $W - $used) { $t = $t.Substring(0, $W - $used) }
                 $fg = $con.Fg
                 if ($s[1]) { $fg = $s[1] }
@@ -4898,7 +6456,7 @@ function Test-ConPass([string]$Key, $X) {
         $ok = switch ($q) {
             'problems' { $X.h -eq 'warn' -or $X.h -eq 'error' }
             'errors' { $X.h -eq 'error' }
-            'blocked' { [bool]$X.blk }
+            'blocked' { [bool]$X.blk -or "$($X.wt)" -cmatch 'blocked' }
             'pending' { $null -ne $X['pd'] -and $X['pd'] -gt 0 }
             'not running' { $X.st -in 'Not running', 'Stopped', 'Failed', 'Retrying' }
             'latency' { $null -ne $X.lat -and $X.lat -ge 30 }
@@ -5229,7 +6787,22 @@ function Get-ConFindingItems([int]$W) {
         }
         $i++
     }
-    return @{ Header = $null; Items = $items; Count = $con.FindList.Count }
+    # live article contract differences (refreshed with the topology) follow the scan findings
+    $con.ContractList = $articleContractRows.ToArray()
+    $c = 0
+    foreach ($row in $con.ContractList) {
+        $severity = 'info'; if ($row.Severity -eq 'warn') { $severity = 'warn' }
+        if (Test-ConText "$severity Article contract $($row.Subscriber) $($row.Article) $($row.Column) $($row.Field)") {
+            $l = New-ConLine
+            Add-ConSeg $l '  '; Add-ConSeg $l (Format-ConCell $severity 6) $conLevelColor[$severity]
+            Add-ConSeg $l ((Format-ConCell 'contract' 12) + ' ') 'White'
+            Add-ConSeg $l ((Format-ConCell "$($row.Subscriber) $($row.Article)" ([math]::Max(16, [int]($W * 0.25)))) + ' ')
+            Add-ConSeg $l "Published column $($row.Column): $($row.Field) [$($row.Expected)] -> [$($row.Actual)]" 'Gray'
+            Add-ConItem $items "contract:$c" @($l)
+        }
+        $c++
+    }
+    return @{ Header = $null; Items = $items; Count = ($con.FindList.Count + $con.ContractList.Count) }
 }
 
 # --- detail views (scrollable lines) ---
@@ -5249,9 +6822,6 @@ function Add-ConTitle($Lines, [string]$Text, [int]$W) {
     $l = New-ConLine
     Add-ConSeg $l (" $Text ".PadRight($W, '-')) 'Cyan'
     $Lines.Add($l)
-}
-function Add-ConWrapped($Lines, $Text, [int]$Indent, [int]$W, $Fg = $null) {
-    foreach ($part in (Split-ConText $Text ($W - $Indent - 1))) { $l = New-ConLine; Add-ConSeg $l ((' ' * $Indent) + $part) $Fg; $Lines.Add($l) }
 }
 function Get-ConStrip($Values, [int]$Len, [switch]$Status) {
     $n = @($Values).Count
@@ -5333,7 +6903,7 @@ function Add-ConRepairLines($Lines, $Acts, [int]$W) {
     }
 }
 function Invoke-ConRepair($D, [string]$Phrase) {
-    $why = Start-MonRepair $null $D.ItemKey ([int]$D.FindId) $D.Action.id $Phrase
+    $why = Start-MonRepair $null $D.ItemKey ([int]$D.FindId) $D.Action.id $Phrase (Get-RepairHash $D.Action)
     if ($why) { Set-ConMsg $why } else { Set-ConMsg "Running: $($D.Action.title) ..." }
 }
 function Get-ConDetailLines([int]$W) {
@@ -5416,6 +6986,12 @@ function Get-ConDetailLines([int]$W) {
             if ($f.Rows) { $t += " rows WHERE $($f.Rows)" }
             if ($f.Excluded) { $t += " columns not published: $($f.Excluded)" }
             Add-ConKv $lines 'Filter' $t 'Cyan' $W
+        }
+        $subContracts = @($articleContractRows.ToArray() | Where-Object { $_.Publication -eq $e.Publication -and $_.Publisher -eq $e.PubServer -and $_.Subscriber -eq $e.SubServer })
+        if ($subContracts.Count -and $mon.ContractAt) { Add-ConKv $lines 'Contracts read' $mon.ContractAt 'DarkGray' $W }
+        foreach ($row in $subContracts) {
+            $severity = 'info'; if ($row.Severity -eq 'warn') { $severity = 'warn' }
+            Add-ConKv $lines 'Contract' "$($row.Article).$($row.Column): $($row.Field) [$($row.Expected)] -> [$($row.Actual)]" $conLevelColor[$severity] $W
         }
         Add-ConKv $lines 'Distributor' "$($e.Distributor) / $($e.DistributionDb) | agent id $($s.AgentId)" $null $W
         if ($s.Notes) { Add-ConKv $lines 'Notes (scan)' $s.Notes 'DarkYellow' $W }
@@ -5734,6 +7310,16 @@ function Open-ConDetail {
                                    @('Finding', $f.Finding, $null), @('Recommendation', $f.Recommendation, 'Cyan')) }
         return
     }
+    if ($k -like 'contract:*') {
+        $row = $con.ContractList[[int]$k.Substring(9)]
+        $severity = 'info'; if ($row.Severity -eq 'warn') { $severity = 'warn' }
+        $parts = @(@('Severity', $severity, $conLevelColor[$severity]), @('Publisher', $row.Publisher, $null), @('Subscriber', $row.Subscriber, $null), @('Article', $row.Article, 'White'),
+                   @('Column', $row.Column, $null), @('Difference', "$($row.Field): publisher [$($row.Expected)] -> subscriber [$($row.Actual)]", $null))
+        if ($mon.ContractAt) { $parts += ,@('Checked at', $mon.ContractAt, 'DarkGray') }
+        $parts += ,@('Recommendation', 'Review article schema options and intentional subscriber differences before changing schema.', 'Cyan')
+        $con.Detail = @{ Kind = 'text'; Key = $k; Title = "Article contract: $($row.Publication) / $($row.Article)"; Scroll = 0; FindId = -1; Acts = $null; Parts = $parts }
+        return
+    }
     if ($mon.SubByKey.ContainsKey($k)) { $kind = 'sub'; $title = $mon.SubByKey[$k].Label }
     elseif ($mon.LrByKey.ContainsKey($k)) { $kind = 'lr'; $title = $mon.LrByKey[$k].Label }
     else { return }
@@ -5920,13 +7506,26 @@ function Step-ConUi {
 }
 
 # Web mode: listener on -ListenAddress/-Port (next free port when taken), access key, page
-function Start-MonWeb {
+function Resolve-MonListenAddress([string]$Address, [bool]$AllowMutating) {
     $ip = [Net.IPAddress]::Loopback
-    if ($ListenAddress -and $ListenAddress -ne 'localhost') {
+    if ($Address -and $Address -ne 'localhost') {
         $parsed = $null
-        if (-not [Net.IPAddress]::TryParse($ListenAddress, [ref]$parsed)) { throw "-ListenAddress '$ListenAddress' is not an IP address. Use 127.0.0.1 (this computer only), 0.0.0.0 (all addresses) or an IP address of this computer." }
+        if (-not [Net.IPAddress]::TryParse($Address, [ref]$parsed)) {
+            throw "-ListenAddress '$Address' is not an IP address. Use 127.0.0.1 (this computer only), 0.0.0.0 (all addresses) or an IP address of this computer."
+        }
         $ip = $parsed
     }
+    $remote = -not [Net.IPAddress]::IsLoopback($ip)
+    if ($remote -and $AllowMutating) {
+        throw "Refusing to bind non-loopback address '$Address' when -AllowRepair, -AllowAllRepair, or -AllowTracerTokens is enabled. Use loopback (-ListenAddress 127.0.0.1) or run read-only remote."
+    }
+    return [pscustomobject]@{ Ip = $ip; Remote = $remote }
+}
+
+function Start-MonWeb {
+    $listen = Resolve-MonListenAddress $ListenAddress ([bool]($AllowRepair -or $AllowAllRepair -or $AllowTracerTokens))
+    $ip = $listen.Ip
+    $mon.Remote = $listen.Remote
     $listener = $null; $tryPort = $Port; $lastErr = ''
     for ($i = 0; $i -lt 10 -and -not $listener; $i++) {
         try {
@@ -5936,9 +7535,11 @@ function Start-MonWeb {
     }
     if (-not $listener) { throw "Cannot listen on $ListenAddress ports $Port-$($tryPort - 1): $lastErr. Use -Port." }
     $mon.Token = [guid]::NewGuid().ToString('N')
+    $mon.ViewToken = [guid]::NewGuid().ToString('N')
     $hostName = 'localhost'
     if ($ip.Equals([Net.IPAddress]::Any)) { $hostName = [Net.Dns]::GetHostName() } elseif (-not $ip.Equals([Net.IPAddress]::Loopback)) { $hostName = $ip.ToString() }
     $mon.Url = "http://${hostName}:$tryPort/?t=$($mon.Token)"
+    Write-Host ('Viewer URL (state only): ' + $mon.Url.Replace($mon.Token, $mon.ViewToken))
     $mon.Lib = $null
     if ($MermaidJs -and (Test-Path -LiteralPath $MermaidJs -PathType Leaf)) { $mon.Lib = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $MermaidJs).ProviderPath) }
     else { Write-Warning "$MermaidJs not found - the monitor works without the diagram." }
@@ -5950,8 +7551,9 @@ function Step-MonQueries {
     $did = $false
     foreach ($t in $mon.Targets.Values) {
         if ($t.PS) {
-            if ($t.Handle.IsCompleted) {
+            if (Test-MonJobDeadline $t $t.Started (Get-Date)) {
                 $r = Complete-MonJob $t.PS $t.Handle
+                if ($t.TimedOut) { $r = Get-MonTimeoutResult 'live' }
                 $t.PS = $null
                 $t.Took = [math]::Round(((Get-Date) - $t.Started).TotalSeconds, 1)
                 try {
@@ -5964,18 +7566,18 @@ function Step-MonQueries {
                 }
                 $did = $true
             }
-        } elseif (-not $mon.Paused -and (Get-Date) -ge $t.Next) { $null = Start-LiveJob $t; $did = $true }
+        } elseif (-not ($t.ContainsKey('Retire') -and $t.Retire) -and -not $mon.Paused -and (Get-Date) -ge $t.Next) { $null = Start-LiveJob $t; $did = $true }
     }
     for ($i = $mon.Deferred.Count - 1; $i -ge 0; $i--) {
         $d = $mon.Deferred[$i]
-        if ($d.Handle.IsCompleted) {
+        if (Test-MonJobDeadline $d $d.T (Get-Date)) {
             $mon.Deferred.RemoveAt($i); $did = $true
             try { $null = Complete-MonQuery $d }
             catch {
                 # an on-demand answer that cannot be processed must not stop the monitor either
                 $m = "Monitor could not process the $($d.Kind) answer: $($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))"
                 Add-MonEvent 'error' $m
-                if ($d.Kind -eq 'repair') { Write-RepairLog "  FAILED: $m"; $mon.Repair = $null }
+                if ($d.Kind -eq 'repair') { $mon.Repair = $null; try { Write-RepairLog "  FAILED: $m" } catch { Write-Warning $_.Exception.Message } }
                 if ($d.C) { try { Send-MonJson $d.C ([ordered]@{ error = $m }) } catch { } } else { Set-ConMsg $m }
             }
         }
@@ -5985,9 +7587,12 @@ function Step-MonQueries {
 # Web requests: read without blocking, answer, close
 function Step-MonWeb($Listener, $Clients) {
     $did = $false
-    while ($Listener.Pending()) {
+    $accepted = 0
+    while ($accepted -lt 8 -and $Listener.Pending()) {
+        $accepted++
         $c = $Listener.AcceptTcpClient()
-        $c.SendTimeout = 15000
+        if ($Clients.Count -ge 32) { $c.Close(); continue }
+        $c.SendTimeout = 250
         $Clients.Add(@{ C = $c; M = (New-Object IO.MemoryStream); T = Get-Date })
         $did = $true
     }
@@ -6007,6 +7612,14 @@ function Step-MonWeb($Listener, $Clients) {
 # -Monitor (web page) or -Console (console view; line mode where the window cannot draw it)
 function Start-ReplMonitor {
     New-MonModel
+    $mon.TopologyAgents = $agents; $mon.TopologyQueue = New-Object 'System.Collections.Generic.Queue[string]'
+    $mon.TopologyNext = (Get-Date).AddSeconds([Math]::Max(1, $TopologyEverySeconds)); $mon.TopologyVersion = 0
+    $mon.ContractQueue = New-Object 'System.Collections.Generic.Queue[string]'; $mon.ContractAt = $null
+    $mon.ContractWarnKeys = @{}; $mon.ContractFailKeys = @{}
+    foreach ($target in $mon.Targets.Values) { $mon.ContractQueue.Enqueue($target.Name) }
+    Initialize-MonListeners
+    Initialize-MonDiscovery
+    if ($PersistHistory) { Initialize-MonHistory $OutputDir $HistoryDays $HistoryMaxMB }
     if ($mon.Targets.Count -eq 0) { throw 'Nothing to monitor: no server was reached.' }
     $mon.Ui = 'web'
     if ($Console) {
@@ -6018,6 +7631,8 @@ function Start-ReplMonitor {
     if ($mon.Ui -eq 'web') { $listener = Start-MonWeb }
     $mon.Pool = [runspacefactory]::CreateRunspacePool(1, [Math]::Max(3, [Math]::Min(16, $mon.Targets.Count + 2)))
     $mon.Pool.Open()
+    $mon.RequestPool = [runspacefactory]::CreateRunspacePool(1, 4)
+    $mon.RequestPool.Open()
     Write-Host ''
     if ($listener) { Write-Host "Replication monitor: $($mon.Url)" -ForegroundColor Green }
     if ($repairMode -eq 'all') { Write-Warning 'Repairs are switched on in full (-AllowAllRepair): also skipping transactions, reinitializing, sp_repldone - each one after typing its confirmation. Log: repairs.log' }
@@ -6026,24 +7641,33 @@ function Start-ReplMonitor {
     if ($listener) { $stopHow = 'Ctrl+C or the Stop button' } elseif ($mon.Ui -eq 'console') { $stopHow = 'q or Ctrl+C' }
     Write-Host ("Servers: {0} · subscriptions: {1} · Log Readers: {2} · refresh every {3} s (pending commands every {4}. refresh) · stop with {5}" -f `
         $mon.Targets.Count, $mon.Subs.Count, $mon.Lrs.Count, $RefreshSeconds, $PendingEvery, $stopHow) -ForegroundColor DarkGray
-    if ($listener -and $ListenAddress -ne '127.0.0.1' -and $ListenAddress -ne 'localhost') { Write-Warning 'The monitor is reachable from other computers (-ListenAddress). Anyone with the address above (it contains the key) can see it.' }
+    if ($listener -and $mon.Remote) { Write-Warning 'The monitor is reachable from other computers (-ListenAddress). Anyone with the address above (it contains the key) can see it.' }
     Add-MonEvent 'info' "Monitor started ($authText)"
     if ($listener -and -not $NoOpen) { try { Start-Process $mon.Url } catch { Write-Warning "Cannot open the browser: $($_.Exception.Message)" } }
-    if ($mon.Ui -eq 'console') { Initialize-ConUi }
     $clients = New-MonList
     try {
+        if ($mon.Ui -eq 'console') { Initialize-ConUi }
         while (-not $mon.Stop) {
             $did = Step-MonQueries
+            Step-MonHistory
+            Step-MonListeners
+            Step-MonTopology
+            Step-MonDiscovery
             if ($listener -and (Step-MonWeb $listener $clients)) { $did = $true }
             if ($mon.Ui -eq 'console' -and (Step-ConUi)) { $did = $true }
             if (-not $did) { Start-Sleep -Milliseconds 40 }
         }
     } finally {
+        if ($mon.ContainsKey('HistoryWriter') -and $mon.HistoryWriter) {
+            try { [void]$mon.HistoryWriter.PS.BeginStop($null, $null) } catch { Write-Verbose $_.Exception.Message }
+        }
         if ($mon.Ui -eq 'console') { Close-ConUi }
         if ($listener) { try { $listener.Stop() } catch { } }
         foreach ($cl in $clients) { try { $cl.C.Close() } catch { } }
         foreach ($d in $mon.Deferred) { if ($d.C) { try { $d.C.Close() } catch { } } }
         foreach ($t in $mon.Targets.Values) { if ($t.PS) { try { [void]$t.PS.BeginStop($null, $null) } catch { } } }
+        foreach ($d in $mon.Deferred) { try { [void]$d.PS.BeginStop($null, $null) } catch { Write-Verbose $_.Exception.Message } }
+        try { $mon.RequestPool.Close(); $mon.RequestPool.Dispose() } catch { Write-Verbose $_.Exception.Message }
         try { $mon.Pool.Close(); $mon.Pool.Dispose() } catch { }
         if ($mon.Ui -eq 'console') { $mon.Ui = 'lines'; Write-MonLine -Force }
         Write-Host 'Replication monitor stopped.' -ForegroundColor Cyan
@@ -6053,6 +7677,7 @@ function Start-ReplMonitor {
 function Get-MonPage {
     $sev = @{ error = 0; warn = 1; info = 2 }
     $static = [ordered]@{
+        topologyVersion = $mon.TopologyVersion
         version = $scriptVersion; auth = $authText; started = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture); interval = $RefreshSeconds
         pendingWarn = $PendingWarn; pendingEvery = $PendingEvery; tracer = [bool]$AllowTracerTokens; repair = $repairMode; masked = (-not $NoMask); lib = ($null -ne $mon.Lib); hints = $monHints
         graph = [ordered]@{
@@ -6081,7 +7706,7 @@ function Get-MonPage {
                         rep = (ConvertTo-RepairJson "$($_.Server) $($_.Object)" (Get-FindingRepairs $_)) } })
         servers = @(@($mon.Targets.Keys) + @($gServers.Keys) | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
     }
-    return $monitorHtml.Replace('{{TOKEN}}', $mon.Token).Replace('{{STATIC}}', (ConvertTo-FastJson $static -Html))
+    return $monitorHtml.Replace('{{TOKEN}}', $mon.Token).Replace('{{VIEWER}}', 'false').Replace('{{STATIC}}', (ConvertTo-FastJson $static -Html))
 }
 
 $monitorHtml = @'
@@ -6109,6 +7734,7 @@ header{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px 
 button,select,input{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:4px 9px}
 button{cursor:pointer}button:hover{background:var(--hov)}button:disabled{opacity:.5;cursor:default}
 button.danger{color:var(--err)}
+body.view-only .op-only{display:none!important}
 .conn{display:inline-flex;align-items:center;gap:6px;color:var(--mut);white-space:nowrap}
 .conn i{width:9px;height:9px;border-radius:50%;background:var(--ok);display:inline-block}
 .conn.live i{animation:pulse 2s infinite}.conn.paused i{background:var(--warn)}.conn.down i{background:var(--err)}
@@ -6203,10 +7829,11 @@ details summary{cursor:pointer;color:var(--acc)}
     <div class="chips" id="chips"></div>
     <div class="ctl">
       <span class="conn" id="conn"><i></i><span id="connText">connecting...</span></span>
-      <label class="mut">every <select id="intv"><option>5</option><option>10</option><option>15</option><option>30</option><option>60</option><option>120</option></select> s</label>
-      <button id="bPause">Pause</button>
-      <button id="bNow" title="Query all servers now, including pending commands">Refresh now</button>
-      <button id="bStop" class="danger" title="Stop the monitor (the PowerShell script ends)">Stop</button>
+      <label class="mut op-only">every <select id="intv"><option>5</option><option>10</option><option>15</option><option>30</option><option>60</option><option>120</option></select> s</label>
+      <button id="bPause" class="op-only">Pause</button>
+      <button id="bTopology" class="op-only" title="Read subscriptions again from known distributors">Topology</button>
+      <button id="bNow" class="op-only" title="Query all servers now, including pending commands">Refresh now</button>
+      <button id="bStop" class="danger op-only" title="Stop the monitor (the PowerShell script ends)">Stop</button>
     </div>
   </div>
   <div class="bar">
@@ -6252,7 +7879,7 @@ details summary{cursor:pointer;color:var(--acc)}
   <section class="tab" id="tab-ag"><div class="hint">Replicas of the availability groups seen by the monitor. A Log Reader reads only changes hardened on every synchronous secondary (unless trace flag 1448 is on) - a lagging or disconnected synchronous replica holds replication back.</div><div class="card tw"><table id="tAg"></table></div></section>
   <section class="tab" id="tab-errors"><div class="hint">Errors written by the replication agents to the distribution database (MSrepl_errors), newest first. "Command" shows the replicated command that failed (sp_browsereplcmds).</div><div class="card tw"><table id="tErr"></table></div></section>
   <section class="tab" id="tab-events"><div class="hint">What changed while the monitor was running: health of subscriptions and Log Readers, blocking, new errors, servers lost and back.</div><div class="card" id="events"></div></section>
-  <section class="tab" id="tab-findings"><div class="hint">Findings of the topology scan made when the monitor started (configuration, versions, security, leftovers). They do not refresh.</div><div class="card tw"><table id="tFind"></table></div></section>
+  <section class="tab" id="tab-findings"><div class="hint" id="findHint">Findings of the topology scan made when the monitor started (configuration, versions, security, leftovers) do not refresh. Article contract rows are live (refreshed with the topology).</div><div class="card tw"><table id="tFind"></table></div></section>
 </main>
 <aside id="drawer"><div class="dh"><h2 id="dTitle"></h2><button id="dClose">Close (Esc)</button></div><div class="db"><div id="dLive"></div><div id="dDetail"></div></div></aside>
 <div id="toast"></div>
@@ -6260,6 +7887,8 @@ details summary{cursor:pointer;color:var(--acc)}
 <script>
 'use strict';
 const T = '{{TOKEN}}';
+const VIEW_ONLY = '{{VIEWER}}' === 'true';
+if (VIEW_ONLY) document.body.classList.add('view-only');
 const S = JSON.parse(document.getElementById('static').textContent);
 const SUB = {}, LR = {}, GN = {};
 S.subs.forEach(s => SUB[s.k] = s); S.lrs.forEach(l => LR[l.k] = l); S.graph.nodes.forEach(n => GN[n.id] = n);
@@ -6271,7 +7900,7 @@ const LAT_W = 30, LAT_E = 300;
 const TABS = [['overview', 'Overview'], ['subs', 'Subscriptions'], ['lrs', 'Log Readers'], ['waits', 'Sessions & waits'], ['ag', 'Availability groups'],
               ['errors', 'Errors'], ['events', 'Events'], ['findings', 'Findings']];
 const QUICK = [['all', 'All'], ['problems', 'Problems'], ['errors', 'Errors'], ['blocked', 'Blocked'], ['pending', 'Pending'], ['notrunning', 'Not running'], ['latency', 'Latency >= ' + LAT_W + ' s']];
-let L = null, LS = {}, LL = {}, drawer = null, stopped = false, pollTimer = null;
+let L = null, LS = {}, LL = {}, drawer = null, stopped = false, pollTimer = null, pollFails = 0;
 const ui = Object.assign({ tab: 'overview', q: '', quick: 'all', srv: '', sort: {} }, (() => { try { return JSON.parse(localStorage.getItem('replmon') || '{}'); } catch (e) { return {}; } })());
 const save = () => { try { localStorage.setItem('replmon', JSON.stringify(ui)); } catch (e) { } };
 const $ = id => document.getElementById(id);
@@ -6520,8 +8149,23 @@ function renderEvents() {
   $('events').innerHTML = ev.length ? ev.map(e => `<div class="ev ${e.k ? 'click' : ''}" data-k="${esc(e.k)}"><span class="mut">${esc(e.t)}</span><span class="dot ${e.l === 'info' ? '' : e.l}"></span><span>${esc(e.x)}</span></div>`).join('') : '<div class="ev"><span></span><span></span><span class="mut">No events yet.</span></div>';
 }
 $('events').addEventListener('click', ev => { const d = ev.target.closest('[data-k]'); if (d && d.dataset.k && itemOfKey(d.dataset.k)) openItem(d.dataset.k); });
+// Article contract differences (publisher column vs subscriber column) - live, refreshed with the topology
+function contractRows() { return L && L.contracts ? L.contracts : []; }
+function contractsFor(s) { return contractRows().filter(c => c.Publication === s.pub && c.Publisher === s.publisher && c.Subscriber === s.subscriber); }
+function contractFinding(c) {
+  return { sev: c.Severity === 'warn' ? 'warn' : 'info', cat: 'Article contract', srv: c.Subscriber, obj: c.Subscriber + ' / ' + c.Article + ' (' + c.Publication + ')',
+           txt: 'Published column ' + c.Column + ': ' + c.Field + ' [' + c.Expected + '] -> [' + c.Actual + ']', fix: 'Review article schema options and intentional subscriber differences before changing schema.', rep: [], id: -1 };
+}
+function contractsHtml(rows) {
+  if (!rows.length) return '';
+  return `<h3>Article contract differences (${rows.length})${L && L.contractsAt ? ` <span class="mut">(read ${esc(String(L.contractsAt).slice(11))})</span>` : ''}</h3><table><thead><tr><th>Article</th><th>Column</th><th>Difference</th><th>Publisher</th><th>Subscriber</th></tr></thead><tbody>` +
+    rows.map(c => `<tr class="lv-${c.Severity === 'warn' ? 'warn' : 'info'}"><td>${esc(c.Article)}</td><td>${esc(c.Column)}</td><td>${esc(c.Field)}</td><td>${esc(c.Expected)}</td><td>${esc(c.Actual)}</td></tr>`).join('') + '</tbody></table>';
+}
 function renderFindings() {
-  const rows = S.findings.filter(f => (!ui.srv || f.srv === ui.srv) && textPass([f.sev, f.cat, f.srv, f.obj, f.txt, f.fix].join(' ').toLowerCase())).map(f => ({ s: { k: '' }, x: null, f: f }));
+  const hint = $('findHint');
+  if (hint) hint.textContent = 'Findings of the topology scan made when the monitor started (configuration, versions, security, leftovers) do not refresh. Article contract rows are live (refreshed with the topology' + (L && L.contractsAt ? ', last read ' + L.contractsAt : '') + ').';
+  const all = S.findings.concat(contractRows().map(contractFinding));
+  const rows = all.filter(f => (!ui.srv || f.srv === ui.srv) && textPass([f.sev, f.cat, f.srv, f.obj, f.txt, f.fix].join(' ').toLowerCase())).map(f => ({ s: { k: '' }, x: null, f: f }));
   renderTable('tFind', [
     { k: 'sev', t: 'Severity', v: r => ({ error: 3, warn: 2, info: 1 })[r.f.sev], f: r => `<span class="dot ${r.f.sev === 'info' ? '' : r.f.sev}"></span>${esc(r.f.sev)}` },
     { k: 'cat', t: 'Category', v: r => r.f.cat, f: r => esc(r.f.cat) },
@@ -6553,7 +8197,7 @@ $('attention').addEventListener('click', ev => { const d = ev.target.closest('[d
 
 // ---------- header, tabs, quick filters ----------
 function renderHead() {
-  $('ver').textContent = 'v' + S.version + ' · ' + S.auth + ' · since ' + S.started.slice(11, 16);
+  $('ver').textContent = 'v' + S.version + ' · ' + S.auth + (VIEW_ONLY ? ' · view-only' : '') + ' · since ' + S.started.slice(11, 16);
   if (!L) return;
   const s = L.sum, c = [];
   const tri = o => `<b class="c-ok">${o.ok}</b>${o.warn ? `<b class="c-warn">${o.warn}</b>` : ''}${o.error ? `<b class="c-error">${o.error}</b>` : ''}${o.unknown ? `<b class="mut">${o.unknown}?</b>` : ''}`;
@@ -6590,7 +8234,7 @@ function renderTabs() {
     lrs: badge(n.lrs + (n.lrs !== S.lrs.length ? '/' + S.lrs.length : ''), s ? sev(s.lrs) : ''),
     waits: s ? badge(s.blocked + s.agentBlocks, 'warn') : '', ag: s ? badge(s.agBad, 'warn') : '',
     errors: s ? badge(s.errHour, 'error') : '', events: L ? badge(L.events.length) : '',
-    findings: badge(S.findings.filter(f => f.sev !== 'info').length)
+    findings: badge(S.findings.filter(f => f.sev !== 'info').length + contractRows().filter(c => c.Severity === 'warn').length)
   };
   $('tabs').innerHTML = TABS.map(t => `<a data-t="${t[0]}" class="${ui.tab === t[0] ? 'on' : ''}">${t[1]}${b[t[0]] || ''}</a>`).join('');
 }
@@ -6778,6 +8422,7 @@ $('dClose').addEventListener('click', closeDrawer);
 async function loadDetail() {
   const d = drawer;
   if (!d || !d.k) return;
+  if (VIEW_ONLY) { d.loading = false; d.data = null; renderDetail(); return; }
   d.loading = true; renderDetail();
   try {
     const r = await api(`/api/detail?k=${encodeURIComponent(d.k)}&h=${d.hours}`);
@@ -6889,11 +8534,14 @@ function renderDetail() {
   const d = drawer;
   if (!d || !d.k) return;
   const s = SUB[d.k], x = d.data;
-  let h = `<h3>History <select id="dHours">${[1, 6, 24, 72, 168, 720].map(v => `<option value="${v}" ${v === d.hours ? 'selected' : ''}>${v < 24 ? v + ' h' : v / 24 + ' d'}</option>`).join('')}</select>
-    <button id="dReload">Reload</button>${s && s.type === 'Transactional' ? ` <button id="dTracer" ${S.tracer ? '' : 'disabled title="Start the monitor with -AllowTracerTokens"'}>Post tracer token</button>` : ''}
- <button id="dAi" title="Markdown file with this problem, names and values masked - for ChatGPT, Claude, Copilot...">Report for AI</button>
+  let h = VIEW_ONLY
+    ? '<div class="mut" style="margin:10px 0 4px">View-only mode: SQL Server history, commands and repairs require the operator link.</div>'
+    : `<h3>History <select id="dHours" class="op-only">${[1, 6, 24, 72, 168, 720].map(v => `<option value="${v}" ${v === d.hours ? 'selected' : ''}>${v < 24 ? v + ' h' : v / 24 + ' d'}</option>`).join('')}</select>
+    <button id="dReload" class="op-only">Reload</button>${!VIEW_ONLY && s && s.type === 'Transactional' ? ` <button id="dTracer" class="op-only" ${S.tracer ? '' : 'disabled title="Start the monitor with -AllowTracerTokens"'}>Post tracer token</button>` : ''}
+ ${VIEW_ONLY ? '' : '<button id="dAi" class="op-only" title="Markdown file with this problem, names and values masked - for ChatGPT, Claude, Copilot...">Report for AI</button>'}
     ${d.loading ? '<span class="mut">loading...</span>' : ''}</h3>`;
   if (x && x.error) h += `<div class="c-error">${esc(x.error)}</div>`;
+  if (s) h += contractsHtml(contractsFor(s));
   if (x && !x.error) {
     if (x.notes && x.notes.length) h += `<div class="c-warn">${esc(x.notes.join(' | '))}</div>`;
     if ((x.repairs || []).length) h += repairsHtml('k', d.k, x.repairs, false);
@@ -6918,10 +8566,10 @@ function renderDetail() {
       x.msgs.filter(m => !/^\s*<stats/.test(m.m)).slice(0, 120).map(m => `<tr><td class="nw mut">${esc(m.t)}</td><td>${m.st ? `<span class="dot" style="background:${ST_COLOR[m.st] || ''}"></span>${esc(ST_NAME[m.st] || '')}` : ''}</td><td>${esc(m.m)}</td></tr>`).join('') + '</tbody></table>';
   }
   $('dDetail').innerHTML = h;
-  $('dHours').onchange = e => { d.hours = +e.target.value; loadDetail(); };
-  $('dReload').onclick = loadDetail;
+  if ($('dHours')) $('dHours').onchange = e => { d.hours = +e.target.value; loadDetail(); };
+  if ($('dReload')) $('dReload').onclick = loadDetail;
   if ($('dTracer')) $('dTracer').onclick = postTracer;
-  $('dAi').onclick = aiReport;
+  if ($('dAi')) $('dAi').onclick = aiReport;
 }
 
 // ---------- repairs and the report for an AI assistant ----------
@@ -6931,7 +8579,7 @@ function repairsHtml(kind, id, list, compact) {
   REP[kind + ':' + id] = list;
   return (compact ? '' : '<h3>Repairs</h3>') + list.map((a, i) => {
     const ref = `data-rk="${kind}" data-rid="${esc(String(id))}" data-ri="${i}"`;
-    const run = a.run ? `<button data-rrun ${ref}>Run</button>` : (a.level === 'script' ? '' : `<span class="mut"> to run it here start the monitor with ${a.level === 'full' ? '-AllowAllRepair' : '-AllowRepair'}</span>`);
+    const run = VIEW_ONLY ? '' : (a.run ? `<button class="op-only" data-rrun ${ref}>Run</button>` : (a.level === 'script' ? '' : `<span class="mut op-only"> to run it here start the monitor with ${a.level === 'full' ? '-AllowAllRepair' : '-AllowRepair'}</span>`));
     return `<div class="rep"><b>${esc(a.title)}</b> <span class="mut">[${esc(REP_LEVEL[a.level] || a.level)}]</span>` +
       (compact ? '' : `<div class="mut">${esc(a.why)}</div><div class="mut">Risk: ${esc(a.risk)}</div>`) +
       `<div><button data-rsql ${ref}>T-SQL</button> <button data-rsave ${ref}>Save .sql</button> ${run}</div><pre class="rsql" style="display:none">${esc(a.sql)}</pre></div>`;
@@ -6960,7 +8608,7 @@ document.addEventListener('click', async ev => {
   b.disabled = true; toast('Running the repair...');
   try {
     const q = (b.dataset.rk === 'f' ? 'f=' : 'k=') + encodeURIComponent(b.dataset.rid);
-    const r = await api(`/api/repair?${q}&a=${encodeURIComponent(a.id)}&c=${encodeURIComponent(c)}`, { method: 'POST' });
+    const r = await api(`/api/repair?${q}&a=${encodeURIComponent(a.id)}&c=${encodeURIComponent(c)}&h=${encodeURIComponent(a.h)}`, { method: 'POST' });
     const x = await r.json();
     toast(x.error ? x.error : x.message);
     if (drawer && drawer.k) setTimeout(() => { if (drawer && drawer.k) loadDetail(); }, 4000);
@@ -6971,11 +8619,31 @@ async function aiReport() {
   const d = drawer;
   if (!d || !d.k) return;
   try {
-    const r = await api('/api/aireport?k=' + encodeURIComponent(d.k), { method: 'POST' });
+    const endpoint = '/api/aireport?k=' + encodeURIComponent(d.k);
+    const r = await api(endpoint + '&preview=1', { method: 'POST' });
     const x = await r.json();
     if (x.error) { toast(x.error); return; }
-    saveText(x.file.split(/[\\/]/).pop(), x.md);
-    toast('Report for AI saved: ' + x.file + (x.masked ? ' - names and values masked; the tokens are in ' + x.map + ' (keep it, do not paste it).' : ' - NOT masked (-NoMask).'));
+    const preview = document.createElement('dialog');
+    preview.style.cssText = 'width:min(900px,90vw);max-height:90vh;padding:18px';
+    preview.innerHTML = '<h2>Report for AI: preview</h2><p></p><textarea readonly aria-label="Report preview" style="box-sizing:border-box;width:100%;height:55vh;font:13px monospace"></textarea><div style="margin-top:12px"><button class="ai-save">Save report</button> <button class="ai-close">Close</button></div>';
+    preview.querySelector('p').textContent = x.masked
+      ? `Checked ${x.validation.checkedNames} known identifiers; none remain. Review the text for other sensitive information before sharing.`
+      : 'Masking is disabled (-NoMask). This report contains original names and values.';
+    preview.querySelector('textarea').value = x.md;
+    preview.addEventListener('close', () => preview.remove());
+    preview.querySelector('.ai-close').onclick = () => preview.close();
+    preview.querySelector('.ai-save').onclick = async event => {
+      const button = event.currentTarget; button.disabled = true;
+      try {
+        // Persist exactly the previewed text, even if live data has changed.
+        const saved = await (await api(endpoint + '&save=' + encodeURIComponent(x.preview), { method: 'POST' })).json();
+        if (saved.error) { toast(saved.error); button.disabled = false; return; }
+        saveText(saved.file.split(/[\\/]/).pop(), saved.md);
+        toast('Report saved: ' + saved.file + (saved.masked ? ' - keep the token map locally: ' + saved.map : ' - NOT masked.'));
+        preview.close();
+      } catch (e) { toast('The report could not be saved: ' + e); button.disabled = false; }
+    };
+    document.body.appendChild(preview); preview.showModal();
   } catch (e) { toast('The monitor did not answer: ' + e); }
 }
 async function postTracer() {
@@ -7003,14 +8671,17 @@ async function poll() {
   try {
     const r = await api('/api/state?since=' + (L ? L.seq : -1));
     if (r.status === 200) {
-      L = await r.json(); LS = {}; LL = {};
+      L = await r.json();
+      if (L.topologyVersion !== S.topologyVersion) { location.reload(); return; }
+      LS = {}; LL = {};
       L.subs.forEach(x => LS[x.k] = x); L.lrs.forEach(x => LL[x.k] = x);
-      renderAll(); conn(true);
-    } else if (r.status === 204) conn(true);
-    else conn(false, 'HTTP ' + r.status);
-  } catch (e) { conn(false); }
-  pollTimer = setTimeout(poll, 2000);
+      renderAll(); conn(true); pollFails = 0;
+    } else if (r.status === 204) { conn(true); pollFails = 0; }
+    else { conn(false, 'HTTP ' + r.status); pollFails++; }
+  } catch (e) { conn(false); pollFails++; }
+  pollTimer = setTimeout(poll, document.hidden ? 10000 : pollFails ? Math.min(30000, 2000 << Math.min(pollFails, 4)) : 2000);
 }
+document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 async function control(a, v) {
   try {
     const r = await api('/api/control?a=' + a + (v != null ? '&v=' + v : ''), { method: 'POST' });
@@ -7021,6 +8692,7 @@ async function control(a, v) {
   } catch (e) { toast('The monitor did not answer.'); }
 }
 $('bPause').addEventListener('click', () => control(L && L.paused ? 'resume' : 'pause'));
+$('bTopology').addEventListener('click', () => { control('topology'); toast('Refreshing topology...'); });
 $('bNow').addEventListener('click', () => { control('refresh'); toast('Querying all servers now (pending commands too)...'); });
 $('intv').addEventListener('change', e => control('interval', e.target.value));
 $('bStop').addEventListener('click', async () => {
@@ -7058,35 +8730,33 @@ Export-ReportCsv ($edges | Sort-Object PubServer, PubDb, Publication, SubServer,
     Select-Object Distributor, DistributionDb, DistributorInstance, PubServer, PubInstance, PubDb, Publication, PubType, Tables, SubServer, SubInstance, SubDb, SubType,
                   Status, StatusText, Health, AgentStatus, Job, @{ n = 'LatencySec'; e = { $_.Latency } }, LastSync, @{ n = 'PendingCmds'; e = { $_.Pending } },
                   Fails, Retries, SkipErrors, Problem, RowDiff, Message, Change, ChangeText) 'edges.csv'
-Export-ReportCsv ($articles | Sort-Object PubServer, PubDb, Publication, Article | Select-Object PubServer, PubDb, Publication, Article, Source, Destination, RowFilter, ExcludedColumns, Change) 'articles.csv'
+Export-ReportCsv ($articles | Sort-Object PubServer, PubDb, Publication, Article | Select-Object PubServer, PubDb, Publication, Article, Source, Destination, RowFilter, ExcludedColumns, FilterMetadataKnown, Change) 'articles.csv'
 Export-ReportCsv $findings 'findings.csv'
+Export-ReportCsv $agReadinessRows 'ag-readiness.csv'
+Export-ReportCsv $articleContractRows 'article-contracts.csv'
 
 # Repairs for the problems of this run (repairs.sql, every block commented out) and the report for an AI assistant
 $repProblems = New-Object System.Collections.Generic.List[object]
 foreach ($e in ($liveSubs | Where-Object { $_.Health -in 'error', 'warn' })) {
     $P = New-Problem
-    $P.Kind = 'sub'; $P.Label = "$($e.Publication): $($e.PubServer)/$($e.PubDb) -> $($e.SubServer)/$($e.SubDb)"; $P.Level = $e.Health; $P.Problem = [string]$e.Problem
+    Set-ProblemSubscription $P $e
+    $P.Label = "$($e.Publication): $($e.PubServer)/$($e.PubDb) -> $($e.SubServer)/$($e.SubDb)"; $P.Level = $e.Health; $P.Problem = [string]$e.Problem
     $P.Status = [string]$e.AgentStatus; $P.Msg = [string]$e.Message; $P.Text = "$($e.Problem) $($e.Message)"
-    $P.PubServer = [string]$e.PubServer; $P.PubName = [string]$e.PubServerRaw; $P.PubDb = [string]$e.PubDb; $P.Publication = [string]$e.Publication; $P.PubType = [string]$e.PubType
-    $P.SubServer = [string]$e.SubServer; $P.SubName = [string]$e.SubServerRaw; $P.SubDb = [string]$e.SubDb; $P.SubType = [string]$e.SubType
-    $P.DistServer = [string]$e.Distributor; $P.DistDb = [string]$e.DistributionDb
-    if ($e.JobKey) {
-        $P.JobSrv = ($e.JobKey -split '\|')[0]; $P.JobId = ($e.JobKey -split '\|')[1]
-        if ($jobIdx.ContainsKey($e.JobKey)) {
-            $j = $jobIdx[$e.JobKey]; $P.JobName = [string]$j.name
-            if (-not $j.enabled) { $P.Job = 'disabled' } elseif ($j.running) { $P.Job = 'running' } else { $P.Job = 'not running' }
-        }
-    }
+    Set-ProblemJob $P ([string]$e.JobKey)
+    $agentKind = 'D'; if ($e.PubType -eq 'Merge') { $agentKind = 'M' }
+    $agentRow = $null
+    if ($e.AgentId) { $agentRow = $agentIdx[(Get-ReplAgentKey $e.DistributorInstance $e.DistributionDb $agentKind $e.AgentId)] }
+    Set-ProblemAgentError $P $agentRow
+    if ($agentRow -and $agentRow.error_text) { $P.Text = "$($P.Text) $($agentRow.error_text)" }
+    Set-ProblemArtFilter $P
     $repProblems.Add($P)
 }
 foreach ($l in ($logReaderRows | Where-Object { $_.Health -ne 'ok' })) {
     $P = New-Problem
-    $P.Kind = 'lr'; $P.Label = "Log Reader $($l.Publisher)/$($l.PubDb)"; $P.Level = $l.Health; $P.Status = [string]$l.Status; $P.Msg = [string]$l.Message
+    $P.Kind = 'lr'; $P.Label = "Log Reader $($l.Publisher)/$($l.PubDb)"; $P.Level = $l.Health; $P.Problem = [string]$l.Problem; $P.Status = [string]$l.Status; $P.Msg = [string]$l.Message
     $P.Text = [string]$l.Message; $P.Job = Get-JobStateWord ([string]$l.Job); $P.PubServer = [string]$l.Publisher; $P.PubDb = [string]$l.PubDb; $P.DistServer = [string]$l.Distributor
-    if ($l.JobKey) {
-        $P.JobSrv = ($l.JobKey -split '\|')[0]; $P.JobId = ($l.JobKey -split '\|')[1]
-        if ($jobIdx.ContainsKey($l.JobKey)) { $P.JobName = [string]$jobIdx[$l.JobKey].name }
-    }
+    Set-ProblemJob $P ([string]$l.JobKey)
+    if (-not $P.Job) { $P.Job = Get-JobStateWord ([string]$l.Job) }
     $inst = Get-PrimaryInstance $l.Publisher
     if (-not $inst) { $inst = $l.Publisher }
     $dbU = ([string]$l.PubDb).ToUpperInvariant()
@@ -7103,7 +8773,7 @@ if ($repBlocks.Count) {
               '-- Every block is commented out, so running this whole file changes nothing. Copy one block, read it,',
               '-- run it in SSMS with Query > SQLCMD Mode (the :CONNECT lines). The monitor (-Monitor / -Console) can run them',
               '-- with -AllowRepair (safe ones) or -AllowAllRepair (all except the scripts that need a password).', '')
-    Set-Content -LiteralPath $repairsFile -Value (($head -join "`r`n") + (($repBlocks | ForEach-Object { "/*`r`n$_`r`n*/" }) -join "`r`n`r`n")) -Encoding UTF8
+    Set-Content -LiteralPath $repairsFile -Value (($head -join "`r`n") + (($repBlocks | ForEach-Object { "/*`r`n$($_ -replace '\*/', '* /')`r`n*/" }) -join "`r`n`r`n")) -Encoding UTF8
 }
 if ($rowCountRows.Count -gt 0) { Export-ReportCsv $rowCountRows 'rowcounts.csv' }
 
@@ -7128,7 +8798,7 @@ $jsonEdges = @($liveEdges | ForEach-Object {
                 Health = $_.Health; AgentStatus = $_.AgentStatus; Job = $_.Job; Latency = $_.Latency; LastSync = $_.LastSync; Pending = $_.Pending
                 Fails = $_.Fails; Problem = $_.Problem; Message = $_.Message; Tables = $_.Tables }
 })
-$jsonArticles = @($articles | ForEach-Object { [ordered]@{ PubKey = $_.PubKey; PubServer = $_.PubServer; PubDb = $_.PubDb; Publication = $_.Publication; Article = $_.Article; Source = $_.Source; Destination = $_.Destination } })
+$jsonArticles = @($articles | ForEach-Object { [ordered]@{ PubKey = $_.PubKey; PubServer = $_.PubServer; PubDb = $_.PubDb; Publication = $_.Publication; Article = $_.Article; Source = $_.Source; Destination = $_.Destination; RowFilter = $_.RowFilter; ExcludedColumns = $_.ExcludedColumns; FilterMetadataKnown = $_.FilterMetadataKnown } })
 $jsonServers = @($srvRows | ForEach-Object {
     [ordered]@{ Server = $_.Server; ConnectedAs = $_.ConnectedAs; Version = $_.Version; Edition = $_.Edition; DistributionDbs = $_.DistributionDbs
                 RemoteDistributor = $_.RemoteDistributor; AgRole = $_.AgRole; Aliases = $_.Aliases; Publications = $_.Publications
@@ -7136,8 +8806,9 @@ $jsonServers = @($srvRows | ForEach-Object {
 })
 $jsonAgs = @($ags.Values | ForEach-Object { [ordered]@{ Name = $_.Name; Listeners = @($_.Listeners); Replicas = $_.Replicas; Databases = $_.DbNames.ToArray(); Primary = $_.Primary } })
 $topologyJson = ConvertTo-JsonText ([ordered]@{
+    schemaVersion = 2
     generated = $generated.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture); version = $scriptVersion; servers = $jsonServers; edges = $jsonEdges
-    articles = $jsonArticles; ags = $jsonAgs; findings = $findings.ToArray()
+    articles = $jsonArticles; ags = $jsonAgs; agReadiness = $agReadinessRows.ToArray(); articleContracts = $articleContractRows.ToArray(); findings = $findings.ToArray()
 })
 [IO.File]::WriteAllText((Join-Path $OutputDir 'topology.json'), $topologyJson, $utf8)
 
@@ -7663,6 +9334,13 @@ foreach ($ag in $ags.Values) {
 $ai.Add(''); $ai.Add('## Servers')
 foreach ($s in ($serverInfo.Values | Sort-Object Server)) { $ai.Add("- $($s.Server): $(Get-SqlYear $s.Version) $($s.Edition); distribution databases: $($s.DistributionDbs); AG role: $($s.AgRole)") }
 $aiSaved = Save-AiReport ($ai -join "`n") $aiM 'ai-report'
+if ($reportRun) {
+    Complete-ReportRun $reportRun
+    $OutputDir = $reportRun.Destination
+    $htmlPath = Join-Path $OutputDir 'topology.html'
+    $aiSaved.File = Join-Path $OutputDir (Split-Path $aiSaved.File -Leaf)
+    if ($aiSaved.Map) { $aiSaved.Map = Join-Path $OutputDir (Split-Path $aiSaved.Map -Leaf) }
+}
 if ($repairsFile) { Write-Host "Repairs: $($repBlocks.Count) script(s) in repairs.sql (commented out - review before running)" -ForegroundColor Cyan }
 Write-Host "Report for an AI assistant: $($aiSaved.File)$(if ($aiSaved.Map) { " (names masked; tokens in $(Split-Path $aiSaved.Map -Leaf) - do not paste that one)" })" -ForegroundColor Cyan
 Write-Host "Output: $OutputDir" -ForegroundColor Green

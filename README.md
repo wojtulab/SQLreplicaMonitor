@@ -15,7 +15,7 @@ the whole topology before they start watching it. By default the script only rea
 replication settings and no data. Writing has to be switched on: `-AllowTracerTokens` for tracer
 tokens, `-AllowRepair` / `-AllowAllRepair` for repairs (section 10).
 
-- Version 1.9 (2026-11-06), author Wojtek, first version 2017-03-14. The full version history
+- Version 1.10 (2026-11-11), author Wojtek, first version 2017-03-14. The full version history
   is in the header of the script.
 - Runs in Windows PowerShell 5.1 and PowerShell 7 without installing modules.
 
@@ -52,6 +52,7 @@ tokens, `-AllowRepair` / `-AllowAllRepair` for repairs (section 10).
 | Edge or Chrome | Only for `topology.pdf` (headless print). Without a browser the PDF is skipped; the HTML has a Print/PDF button. |
 | Console font | For `-Console`: Windows Terminal, or the classic console with a TrueType font (Consolas, Lucida Console) shows the `■ ░ ▒ ▓ █` characters. |
 | `tests/` | Only for development: the Docker test bed (SQL Server 2022, availability group, replication) and the test scripts - see [tests/README.md](tests/README.md). Not needed to run the tool. |
+| `src/`, `build.ps1` | Only for development: source modules and the deterministic build script that generates `Get-ReplTopology.ps1` (see [MAPA_SKRYPTU.md](MAPA_SKRYPTU.md)). Not needed at deployment. |
 
 Execution policy: if scripts are blocked, run `powershell -ExecutionPolicy Bypass -File .\Get-ReplTopology.ps1 ...`,
 or unblock the downloaded file with `Unblock-File .\Get-ReplTopology.ps1`.
@@ -266,8 +267,13 @@ Stop button on the page. No files are written.
 - It listens on 127.0.0.1 by default, so only this computer can open it.
 - The address contains a random access key; the API accepts the key only in a header.
 - The page loads nothing from the internet and sends nothing anywhere.
-- `-ListenAddress 0.0.0.0` lets other computers open it. The traffic is plain HTTP, so share
-  the address with care.
+- `-ListenAddress 0.0.0.0` lets other computers open it in **read-only** mode. The traffic is
+  plain HTTP, so share the address with care. Combining a non-loopback `-ListenAddress` with
+  `-AllowRepair`, `-AllowAllRepair` or `-AllowTracerTokens` is refused at startup (use
+  `127.0.0.1` for mutating actions).
+- The Viewer URL uses a separate read-only token (`ViewToken`) that rejects mutating API calls
+  with HTTP 403 and hides operator controls (`Pause`, `Topology`, `Stop`, `Refresh now`, interval,
+  tracer posting, `Report for AI` and `Run` repair buttons) in the web UI.
 - If port 8642 is taken, the next free port is used (`-Port` sets another one).
 
 **Header.**
@@ -293,7 +299,7 @@ Stop button on the page. No files are written.
 | Availability groups | Role, mode, synchronization, send and redo queue, lag behind the primary |
 | Errors | MSrepl_errors per error event, newest first: the cause (for 14151 "agent failed", the error behind it; the details an agent writes under the next id stay with their error), repeats collapsed ("repeated 12 times since ..."), what to do, the .NET stack trace folded when the agent wrote one, and a Command button that shows the replicated command that failed |
 | Events | What changed while the monitor ran: health changes, blocking started/ended, new replication errors, servers lost and back, pause/resume, tracer tokens |
-| Findings | The audit from the discovery (does not refresh), with a Repair column (section 10) |
+| Findings | Audit findings from discovery plus live article column contract warnings (which refresh on the topology cadence), with a Repair column (section 10) |
 
 **Detail.** Click a subscription or a Log Reader. A panel opens with:
 - the live facts and the agent sessions with their waits, plus who blocks the agent;
@@ -338,7 +344,7 @@ The same live data as the web page, drawn in the PowerShell window. There is no 
   shows them correctly. The console colors are restored on exit, also after Ctrl+C.
 
 ```
- Replication Monitor 1.9 | SQL login 'sa' | every 5 s | 20:01:53 live        Space pause  r refresh  +/- interval  q quit
+ Replication Monitor 1.10 | SQL login 'sa' | every 5 s | 20:01:53 live        Space pause  r refresh  +/- interval  q quit
  Subscriptions 4 ok 1 warn 1 error | Log Readers 2 ok | Blocked 1 | Errors 1 h 22 | Max latency 2 s | Pending 9,618 | Flow 40.0 cmd/s
  1 Subscriptions  2 Log Readers  3 Blocking+waits  4 AG  5 Errors  6 Events  7 Servers  8 Findings   sort: health
   Health  Status      Publication   Publisher/DB -> Subscriber/DB   Latency trend      Pending   Oldest   cmd/s Activity Problem / wait
@@ -400,6 +406,11 @@ event. Keys pressed while the topology is being read are ignored.
 
 ## 10. Repairs and reports for an AI assistant
 
+> 1.10: a repair runs only if it is still the one that was shown (a fingerprint of its steps goes
+> with the click); if new data changed it, reload the detail. Refusals are written to `repairs.log`.
+> The AI report also masks quoted values, `DOMAIN\account`, UNC paths and IPv6 addresses.
+> CSV cells that start with `=`, `+`, `-` or `@` get a leading apostrophe (Excel would run them as formulas).
+
 Without extra switches the script only reads. It still says what to do: every problem the
 catalog knows gets a repair script, and any subscription or Log Reader can be written to a report
 for an AI assistant (ChatGPT, Claude, Copilot ...).
@@ -409,7 +420,7 @@ for an AI assistant (ChatGPT, Claude, Copilot ...).
 | Level | What it does | Runs in the monitors with |
 |---|---|---|
 | safe | Starts what should run: agent jobs, the Snapshot Agent, the distribution clean up job | `-AllowRepair`, after a confirmation |
-| full | Changes data or settings: skips a transaction, reinitializes, `sp_replrestart`, `sp_repldone`, redirects a publisher | `-AllowAllRepair`, after typing a word such as `SKIP` |
+| full | Changes data or settings: skips a verified independent push/pull transaction, reinitializes, redirects a publisher | `-AllowAllRepair`, after typing a word such as `SKIP` |
 | script | Needs a password or a decision: agent passwords, AG registration, tablediff | never - save it and run it in SSMS |
 
 **The catalog.**
@@ -420,10 +431,10 @@ for an AI assistant (ChatGPT, Claude, Copilot ...).
 | Agent failed or retrying while its job runs (network break, timeout, deadlock) | Restart the job | safe |
 | Subscription UNINITIALIZED | Start the Snapshot Agent (the pull agent job gets "start the job") | safe |
 | Subscription inactive or expired (21074) | Reinitialize (`sp_reinitsubscription` / `sp_reinitpullsubscription`) and start a snapshot | full |
-| Row not found at the subscriber (20598), duplicate key (2601, 2627) | Skip the failing transaction: stop the job, `sp_setsubscriptionxactseqno` at the subscriber, start the job | full |
+| Row not found at the subscriber (20598), duplicate key (2601, 2627) | Verify current error/capabilities, stop and confirm the agent, verify again, set the subscriber position, start the job | full for verified independent transactional push or pull; otherwise script |
 | The same | Compare the table of the failing command and generate the fix (`tablediff` command line); on a filtered article a count with the filter at both sides instead - tablediff knows no filter and its fix would copy the rows and columns the filter leaves out | script |
-| Log Reader cannot find its log position (sp_repldone / LSN errors, e.g. after a restore) | `sp_replrestart` between stopping and starting the Log Reader | full |
-| Publisher log full, log_reuse_wait = REPLICATION | `sp_repldone` + `sp_replflush` - last resort, the subscriptions have to be reinitialized afterwards | full |
+| Log Reader cannot find its log position (sp_repldone / LSN errors, e.g. after a restore) | `sp_replrestart` between stopping and starting the Log Reader | script |
+| Publisher log full, log_reuse_wait = REPLICATION | `sp_repldone` + `sp_replflush` - last resort, the subscriptions have to be reinitialized afterwards | script |
 | Login failed (password changed) | New password for the push / pull agent or the Log Reader (`sp_changesubscription`, `sp_change_subscription_properties`, `sp_changelogreader_agent`) | script |
 | Finding: distribution clean up job disabled, failed or not run recently | Enable and start it / run it | safe |
 | Finding: AG replica not a publisher at the distributor | `sp_adddistpublisher` at the distributor; `sp_adddistributor` and the push subscribers as linked servers on the replica | script |
@@ -453,8 +464,26 @@ tokens, agent sessions and blocking, the AG state, related findings, versions an
 tool offers. Names of servers, instances, listeners, AGs, databases, publications, tables and
 replication jobs become tokens (SRV1, DB2, PUB1, TAB3 ...), values in replicated commands and
 duplicate keys become their type, IP addresses and domain names disappear. The tokens are listed
-in `<report>.names.txt` next to the report - keep that file, do not paste it. `-NoMask` writes the
+in `<report>.names.txt` next to the report with restricted file permissions (`0600` on Linux,
+current-user-only ACL via `icacls` on Windows) - keep that file, do not paste it. `-NoMask` writes the
 report without masking (for an assistant your company approved).
+
+Known structured item fields use exact name lookups, including short identifiers.
+Fully qualified table names and column contract metadata also feed the name map.
+Before preview or publication, the exporter checks for remaining registered
+identifiers and refuses a masked export if any remain. Tokens are kept distinct
+from actual names such as `DB1`. This validation covers known identifiers;
+free text still needs review for other sensitive information.
+
+In the web monitor, **Report for AI** opens a text preview. It writes no files
+until **Save report** is clicked. Save publishes exactly the previewed text and
+its matching token map, even if live state changes meanwhile. Previews expire
+after ten minutes; the monitor retains at most eight. Both operations require
+the operator token. The API uses `POST /api/aireport?k=<key>&preview=1`, then
+`POST /api/aireport?save=<preview id>`; validation metadata contains counts and
+scope, never the original names. The existing direct export API remains available.
+For report mode and console exports, review the generated Markdown file before
+sharing it. With `-NoMask`, the preview explicitly states that masking is disabled.
 
 ## 11. Health rules
 
@@ -568,7 +597,7 @@ The monitor uses about 1% CPU between refreshes, with short peaks while the serv
 | `-NoHealth` | off | report | Skip agent health (topology only) |
 | `-NoPendingCommands` | off | report | Skip counting pending commands |
 | `-NoRowCounts` | off | report | Skip row counts |
-| `-FilteredRowCounts` | off | report | Count the publisher rows of row-filtered articles with their WHERE, so they are compared too (a COUNT on the publisher table) |
+| `-FilteredRowCounts` | off | report | Count the publisher rows of row-filtered articles with their validated WHERE filter under `READ UNCOMMITTED` / `WITH (NOLOCK)`, batched per database |
 | `-PendingWarn` | 10000 | all | Pending commands from which a warning is raised |
 | `-HistoryHours` | 24 | all | Failures and retries period; first load of errors in the monitors |
 | `-LogUsedWarn` | 70 | report | Publisher log usage (%) for a warning |
@@ -585,7 +614,7 @@ The monitor uses about 1% CPU between refreshes, with short peaks while the serv
 | `-Monitor` | off | web | Live monitor in the browser |
 | `-Console` | off | console | Live monitor in the console window (implies `-Monitor`) |
 | `-Port` | 8642 | web | TCP port (the next free port is used when taken) |
-| `-ListenAddress` | 127.0.0.1 | web | 0.0.0.0 to open the page from other computers |
+| `-ListenAddress` | 127.0.0.1 | web | `0.0.0.0` to open the page read-only from other computers (refused with `-AllowRepair`, `-AllowAllRepair` or `-AllowTracerTokens`) |
 | `-RefreshSeconds` | 10 | web, console | How often each server is queried (2-3600; can be changed live) |
 | `-PendingEvery` | 3 | web, console | Count pending commands every N-th refresh |
 | `-AllowTracerTokens` | off | web, console | Allow posting tracer tokens |
@@ -604,8 +633,11 @@ The monitor uses about 1% CPU between refreshes, with short peaks while the serv
 # Only the topology, fast (no health, no pending commands, no row counts)
 .\Get-ReplTopology.ps1 -Servers SQLDIST1 -NoHealth -NoRowCounts -NoPdf
 
-# Web monitor on another port, open for the team, refresh every 5 s, tracer tokens allowed
-.\Get-ReplTopology.ps1 -Servers .\servers.txt -Monitor -Port 9000 -ListenAddress 0.0.0.0 -RefreshSeconds 5 -AllowTracerTokens
+# Read-only web monitor on another port, open for the team, refresh every 5 s
+.\Get-ReplTopology.ps1 -Servers .\servers.txt -Monitor -Port 9000 -ListenAddress 0.0.0.0 -RefreshSeconds 5
+
+# Local web monitor with tracer tokens allowed (must listen on loopback)
+.\Get-ReplTopology.ps1 -Servers .\servers.txt -Monitor -Port 9000 -ListenAddress 127.0.0.1 -RefreshSeconds 5 -AllowTracerTokens
 
 # Console monitor with a SQL login; pending commands counted every 5th refresh (large distributor)
 .\Get-ReplTopology.ps1 -Servers .\servers.txt -Console -SqlUser sa -PendingEvery 5
@@ -634,3 +666,173 @@ The monitor uses about 1% CPU between refreshes, with short peaks while the serv
 | A repair says "does not apply any more" | The state changed since the detail was loaded (the agent recovered, another repair ran). Reload the detail. |
 | A repair fails with a permission error | Jobs need `SQLAgentOperatorRole` (or sysadmin), the other repairs `db_owner` or sysadmin - see Permissions. The step and the error are in `repairs.log`. |
 | `-Scan` finds nothing | SQL Browser is stopped, UDP 1434 is blocked, or the servers are in another subnet. Use `-ScanHost <names>` or `-Servers`. |
+
+### Audit and deployment updates (2026-11-12 to 2026-11-13)
+
+The web monitor prints a separate viewer URL. Its token (`ViewToken`) permits the page,
+library and state endpoint only; details, replicated SQL commands, AI export,
+tracers, repairs and controls require the operator token (constant-time check; HTTP 403
+otherwise), and the viewer UI hides operator controls. Non-loopback `-ListenAddress`
+bindings are read-only and refuse `-AllowRepair`, `-AllowAllRepair` or `-AllowTracerTokens`.
+
+`replrestart` and `repldone` remain manual scripts. `skip-tx` has guarded execution
+for independent transactional push and pull subscriptions; shared-agent (`ALL`) and
+multi-stream cases stay manual. `reinit`, `snapshot`, `ag-redirect`, agent job and
+cleanup job repairs include SQL preflight checks before running. Merge/P2P data repairs
+are withheld until type-specific procedures are implemented. Live/detail collectors have a 120-second SQL work
+budget; individual SQL commands use the remaining budget. Zero connection/query
+timeouts retain the client's unlimited semantics outside these budgeted tasks.
+This does not provide asynchronous cancellation of a blocked connection open.
+
+Pending samples expose `pendingStatus`, `pendingAge` (seconds since last success)
+and `pendingError` in monitor state. Failed reads invalidate the count immediately;
+successful samples expire after max(60 seconds, three scheduled Pending periods).
+Unknown/stale counts are shown as a problem rather than a confirmed zero.
+
+The monitor also enforces a 120-second deadline from task submission, including
+pool wait and connection open. Cancellation is asynchronous and cooperative;
+the slot stays occupied until the driver acknowledges stopping. A repair or
+tracer timeout means the outcome is unknown: check the server before retrying.
+On-demand work has a separate pool (up to four tasks); duplicate active requests
+are refused, preserving the live collection pool for monitoring.
+
+Full reports are generated in `.run-<guid>` under the output directory and then
+published. `report-manifest.json` is committed last: `complete` lists the current
+run's files, sizes and SHA256 hashes. A `running` manifest means generation or
+publication is incomplete; do not treat the directory as a consistent report.
+On failure the staging directory remains for diagnosis. Only fixed tool-owned
+artifacts absent from the new run are removed; user files and older AI exports
+are retained. `-TestOnly` updates connections.csv without publishing a full manifest.
+
+### Persistent monitor metrics
+
+`-Monitor -PersistHistory` (also `-Console`) writes numeric latency, rate and
+Pending samples to `monitor-history.jsonl` in OutputDir. The background writer
+rotates to `monitor-history.previous.jsonl`; each file is bounded by
+`-HistoryMaxMB` (default 8, range 1–64). The queue holds at most 256 samples.
+Slow or failed storage can lose a batch; it emits a warning and does not stop
+live collection. A forced stop can lose the final queued/in-flight batch.
+
+`-HistoryDays` (default 7, range 1–365) controls replay age; files untouched
+for that many days are removed by the writer. Active files rotate by size.
+Replay restores the last 60 values per metric for currently known subscriptions
+and Log Readers; old or malformed records are skipped. Files contain identifiers
+and numeric/null values, without SQL commands, credentials or error texts.
+Missing Pending measurements remain null in history.
+
+The Events view reports three consecutive backlog increases once per incident;
+a measured decrease emits recovery. Existing no-progress and freshness checks
+remain active. Webhooks and long-term history browsing are not implemented yet.
+
+Article filter snapshots now use `schemaVersion: 2` in topology.json and retain
+row filters, excluded columns and whether filter metadata was actually read.
+`-CompareTo` reports filter edits in changes.csv, including removal and
+case-sensitive changes inside predicates. Older JSON without filter metadata
+still loads; it does not create false filter-removal changes.
+
+`python3 tests/checks_regression.py` verifies the check harness using disposable
+copies of `build.ps1`, `src/`, `bench.*` and `tests/`: baseline success plus build drift,
+PowerShell syntax, both JS pages, PSSA 5.1 compatibility and unit failures. Run `tests/checks.sh`
+directly to validate the assembled script (`build.ps1 -Check` requires rebuilding `Get-ReplTopology.ps1`
+via `pwsh -NoProfile -File build.ps1` after editing `src/*` or `src/web/*`).
+
+AG failover configuration checks now inspect distributor configuration and
+push-subscriber linked servers on every reached replica. Results appear in
+`ag-readiness.csv` and `topology.json` (`agReadiness`), with missing prerequisites
+in Findings and unverified prerequisites in Coverage. Missing linked servers are
+confirmed only with complete metadata visibility (currently sysadmin); visible
+entries can be confirmed under restricted access. Presence does not test agent
+credentials. These checks neither start jobs nor trigger failover.
+
+The report compares published column contracts with subscriber tables using
+catalog metadata: type, byte length, precision/scale, nullability, primary-key
+ordinal and collation. It reads no table data for this check and works with
+`-NoRowCounts`. Complete metadata requires database VIEW DEFINITION; denied
+or unresolved metadata is Coverage, not a successful comparison. Merge articles
+are excluded. Only published columns are compared; extra subscriber columns
+and extra indexes are not findings. Missing published columns are always a
+warning. Other differences read the publishing article's `sysarticles.schema_option`
+([sp_addarticle](https://learn.microsoft.com/en-us/sql/relational-databases/system-stored-procedures/sp-addarticle-transact-sql?view=sql-server-ver17))
+and are informational only when a bit documents exactly that source/destination
+type pair (timestamp/binary, xml/ntext, hierarchyid/varbinary, geography or
+geometry/varbinary), or when the matching "replicate X" bit is off for PK/collation;
+a bit present elsewhere in `schema_option` that does not cover the actual type
+pair, an unknown `schema_option`, or any nullability difference is a warning.
+Review warnings before changing schema. Results appear in Findings,
+`article-contracts.csv` and JSON `articleContracts`.
+
+The monitor refreshes the same comparison on the topology-refresh cadence
+(`-TopologyEverySeconds`, `POST /api/control?a=topology`): current rows and the
+last refresh time are in `/api/state` (`contracts`, `contractsAt`), visible to
+viewer and operator tokens alike. A new warning or a resolved one raises one
+event; an unchanged one does not repeat every cycle. Reads for databases the
+monitor cannot access drop that database's prior rows rather than keep them
+looking current.
+
+### Refreshing subscriptions while monitoring
+
+The monitor rereads known servers every `-TopologyEverySeconds` (default
+300; zero disables automatic refresh). The web **Topology** button or operator
+`POST /api/control?a=topology` requests this explicitly. Newly added or removed
+subscriptions update the tables and console without restarting the monitor;
+the web page reloads its catalog while filters remain in local storage. Existing
+metric histories and live jobs survive reconciliation. A repair and topology
+refresh cannot run concurrently. Failed/partial distribution database reads
+never imply removal of its subscriptions.
+
+With crawling enabled, refreshed metadata can discover additional publishers,
+subscribers, distributors and AG replicas/listeners. New endpoints reuse the
+configured authentication, TLS settings and known port/routing mappings. Names
+and endpoints are deduplicated; `-MaxServers` includes reserved connection
+attempts, including failed ones. A failed endpoint is attempted once per run
+unless its address changes. Discovery uses one background collector at a time,
+within `-ThrottleLimit`, and shares the bounded on-demand pool; live polling
+continues separately. Pause and repair gates also apply to discovery.
+
+`-NoCrawl` keeps the connection set fixed: subscriptions mentioning a new server
+can appear from distributor metadata, but the monitor does not connect to that
+server. Tables and the graph use the same refreshed subscription catalog and
+shared graph generator. Removed subscriptions release their in-memory metric
+caches; histories of retained subscriptions survive reconciliation.
+
+AG listeners reached during startup are probed at max(10 seconds, refresh interval)
+using the same previously used address. When a listener reaches another replica
+already known in that AG, the primary mapping and graph update automatically.
+Metric histories remain attached to the same subscription keys. Physical replica
+addresses continue to be monitored; a target represented solely by a listener is
+retired after its in-flight invocation ends. Unknown replica identities are
+refused. These probes respect repair/pause gates and run even when periodic
+subscription catalog refresh is disabled. A listener also used for a distribution
+database is conservatively refused migration and reports a rediscovery warning.
+
+Listener migration also requires the reached replica's PRIMARY role to be
+confirmed by AG metadata. A reachable secondary or unreadable role does not
+cause migration; the monitor reports the reason. This is intentionally separate
+from a successful SQL login. It needs sufficient AG metadata/DMV permissions.
+
+### Transaction skip preflight
+
+Executable `skip-tx` requires `-AllowAllRepair`, the current action fingerprint
+and `SKIP`. It covers currently failing transactional **push and pull** subscriptions
+with an independent agent and a known error/LSN (including continuous agents whose job
+has stopped after failing with `FAILED`/`RETRY` in `Problem`). Pre-stop and post-stop
+phases check the publication, distributor agent/job/error (and for pull, the subscriber
+job command and streams), confirm job idle state, recheck the failing LSN and subscriber
+position/permissions, set `sp_setsubscriptionxactseqno`, and start the job. Multiple
+streams, explicit stream overrides, changed errors, advanced subscriber watermarks and
+unsupported metadata are refused. The operation omits an entire transaction and still
+requires data reconciliation afterwards.
+
+A later failure leaves already completed steps in place and reports their count;
+it can leave the job stopped. The tool does not automatically restart it after
+a failed position change. Shared-agent subscriptions require manual review and emit
+scripts with publication `ALL`. Merge/P2P are not offered transactional skip and
+Snapshot is excluded from this operation.
+
+Lab integration test: start `tests/run_monitor.sh` with `-AllowAllRepair`,
+`-RefreshSeconds 2`, `-TopologyEverySeconds 0` and a log at
+`tests/out/audit-skip-seven.log`, then run
+`python3 tests/skip_repair_probe.py`. This lab-only test deletes a row from
+ArchiveC, updates the republishing source, executes the guarded repair through
+the API, checks replay refusal, restores the row/source and stops the monitor.
+It requires the SQLA/SQLB1/SQLC lab; do not use it as a production diagnostic.
